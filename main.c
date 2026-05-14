@@ -6,6 +6,309 @@
 // Global Application Data
 static AppData *app_data = NULL;
 
+// Establish an SSH connection
+void connect_ssh(AppData *data) {
+    if (data->connected) {
+        disconnect_ssh(data);
+        return;
+    }
+    
+    const char *host = gtk_entry_get_text(GTK_ENTRY(data->host_entry));
+    const char *user = gtk_entry_get_text(GTK_ENTRY(data->user_entry));
+    const char *password = gtk_entry_get_text(GTK_ENTRY(data->password_entry));
+    const char *port_str = gtk_entry_get_text(GTK_ENTRY(data->port_entry));
+    
+    int port = 22;
+    if (strlen(port_str) > 0) {
+        port = atoi(port_str);
+    }
+    
+    if (strlen(host) == 0 || strlen(user) == 0) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Host and user required!");
+        return;
+    }
+    
+    data->session = ssh_new();
+    if (!data->session) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Error creating SSH session");
+        return;
+    }
+    
+    ssh_options_set(data->session, SSH_OPTIONS_HOST, host);
+    ssh_options_set(data->session, SSH_OPTIONS_USER, user);
+    ssh_options_set(data->session, SSH_OPTIONS_PORT, &port);
+    
+    if (ssh_connect(data->session) != SSH_OK) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Connection error: %s", ssh_get_error(data->session));
+        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        ssh_free(data->session);
+        data->session = NULL;
+        return;
+    }
+    
+    // Fingerprint verification
+    if (!verify_ssh_fingerprint(data->session, host, port)) {
+        // User disconnected
+        ssh_disconnect(data->session);
+        ssh_free(data->session);
+        data->session = NULL;
+        return;
+    }
+    
+    // Authentication
+    int auth_result = SSH_AUTH_ERROR;
+    const char *key_file_path = gtk_entry_get_text(GTK_ENTRY(data->key_file_entry));
+    
+    // First try key file authentication, if specified.
+    if (strlen(key_file_path) > 0) {
+        ssh_key privkey = NULL;
+        int rc = ssh_pki_import_privkey_file(key_file_path, NULL, NULL, NULL, &privkey);
+        
+        if (rc == SSH_OK && privkey != NULL) {
+            // The key file is not password protected.
+            auth_result = ssh_userauth_publickey(data->session, NULL, privkey);
+            ssh_key_free(privkey);
+        } else if (rc == SSH_EOF || rc == SSH_ERROR) {
+            // The key file may be password protected; try using a password.
+            char *key_password = prompt_key_file_password();
+            if (key_password) {
+                rc = ssh_pki_import_privkey_file(key_file_path, key_password, NULL, NULL, &privkey);
+                if (rc == SSH_OK && privkey != NULL) {
+                    auth_result = ssh_userauth_publickey(data->session, NULL, privkey);
+                    ssh_key_free(privkey);
+                }
+                // Delete password
+                memset(key_password, 0, strlen(key_password));
+                g_free(key_password);
+            }
+        }
+    }
+    
+    // If key file authentication failed or was not specified, try password authentication
+    if (auth_result != SSH_AUTH_SUCCESS) {
+        // If a password has been entered in the field, try directly
+        if (strlen(password) > 0) {
+            auth_result = ssh_userauth_password(data->session, NULL, password);
+        } else {
+            // No password entered - try again without a password (automatic public key authentication)
+            auth_result = ssh_userauth_autopubkey(data->session, NULL);
+            
+            // If that fails, ask for a password.
+            if (auth_result != SSH_AUTH_SUCCESS) {
+                char *dialog_password = prompt_ssh_password();
+                if (dialog_password) {
+                    auth_result = ssh_userauth_password(data->session, NULL, dialog_password);
+                    // Delete password
+                    memset(dialog_password, 0, strlen(dialog_password));
+                    g_free(dialog_password);
+                } else {
+                    // User canceled
+                    gtk_label_set_text(GTK_LABEL(data->status_label), "Connection cancelled");
+                    ssh_disconnect(data->session);
+                    ssh_free(data->session);
+                    data->session = NULL;
+                    return;
+                }
+            }
+        }
+    }
+    
+    // If password authentication failed, try keyboard interactive authentication
+    if (auth_result != SSH_AUTH_SUCCESS) {
+        // If a password has been entered in the field, try directly
+        if (strlen(password) > 0) {
+            auth_result = ssh_userauth_kbdint(data->session, NULL, NULL);
+            while (auth_result == SSH_AUTH_INFO) {
+                int prompts;
+                prompts = ssh_userauth_kbdint_getnprompts(data->session);
+                char buffer[128];
+                int i;
+
+                for (i = 0; i < prompts; i++) {
+                    const char *answer;
+                    const char *prompt;
+                    char echo;
+
+                    prompt = ssh_userauth_kbdint_getprompt(data->session, i, &echo);
+                    if (prompt == NULL) {
+                        break;
+                    }
+
+                    // TODO: Prompt should be printed. It should be managed in the GUI. Let's not worry about it for now.
+                    if (echo) {
+                        char *p;
+                        
+                        printf("prompt: %s", prompt);
+
+                        if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
+                            auth_result = SSH_AUTH_ERROR;
+                            return;
+                        }
+
+                        buffer[sizeof(buffer) - 1] = '\0';
+                        if ((p = strchr(buffer, '\n'))) {
+                            *p = '\0';
+                        }
+
+                        if (ssh_userauth_kbdint_setanswer(data->session, i, buffer) < 0) {
+                            auth_result = SSH_AUTH_ERROR;
+                            return;
+                        }
+
+                        memset(buffer, 0, strlen(buffer));
+                    } else {
+                        // TODO: Delete this
+                        printf ("Password: %s\nPrompt: %s\n", password, prompt);
+                        // It's asking the password
+                        if (password && strstr(prompt, "Password")) {
+                            answer = password;
+                        // TODO: It's asking for something else. It should be managed in the GUI. Let's not worry about it for now.
+                        } else {
+                            buffer[0] = '\0';
+
+                            if (ssh_getpass(prompt, buffer, sizeof(buffer), 0, 0) < 0) {
+                                return SSH_AUTH_ERROR;
+                            }
+                            answer = buffer;
+                        }
+                        // TODO: Delete this
+                        printf ("Answer: %s\n", answer);
+                        auth_result = ssh_userauth_kbdint_setanswer(data->session, i, answer);
+                        memset(buffer, 0, sizeof(buffer));
+                        if (auth_result < 0) {
+                            auth_result = SSH_AUTH_ERROR;
+                            return;
+                        }
+                    }
+                }
+                auth_result=ssh_userauth_kbdint(data->session,NULL,NULL);
+                // TODO: Delete this
+                printf ("auth_result: %d\n", auth_result);
+            }
+        } else {
+            // No password entered - try again without a password (automatic public key authentication)
+            auth_result = ssh_userauth_autopubkey(data->session, NULL);
+            
+            // If that fails, ask for a password.
+            if (auth_result != SSH_AUTH_SUCCESS) {
+                char *dialog_password = prompt_ssh_password();
+                if (dialog_password) {
+                    auth_result = ssh_userauth_password(data->session, NULL, dialog_password);
+                    // Delete password
+                    memset(dialog_password, 0, strlen(dialog_password));
+                    g_free(dialog_password);
+                } else {
+                    // User canceled
+                    gtk_label_set_text(GTK_LABEL(data->status_label), "Connection cancelled");
+                    ssh_disconnect(data->session);
+                    ssh_free(data->session);
+                    data->session = NULL;
+                    return;
+                }
+            }
+        }
+    }
+    
+    if (auth_result != SSH_AUTH_SUCCESS) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Authentication error: %s", ssh_get_error(data->session));
+        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        ssh_disconnect(data->session);
+        ssh_free(data->session);
+        data->session = NULL;
+        return;
+    }
+    
+    // Read protocol selection
+    int protocol_index = gtk_combo_box_get_active(GTK_COMBO_BOX(data->protocol_combo));
+    data->use_scp = (protocol_index == 1); // 0 = SFTP, 1 = SCP
+    
+    // Create an SFTP session only if SFTP was selected.
+    if (!data->use_scp) {
+        // Check if the SSH session is still valid.
+        if (!data->session || ssh_is_connected(data->session) == 0) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "SSH session not connected. Cannot create SFTP session.");
+            gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+            if (data->session) {
+                ssh_disconnect(data->session);
+                ssh_free(data->session);
+                data->session = NULL;
+            }
+            return;
+        }
+        
+    data->sftp = sftp_new(data->session);
+    if (!data->sftp) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "Error creating SFTP session: %s", ssh_get_error(data->session));
+            gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        ssh_disconnect(data->session);
+        ssh_free(data->session);
+        data->session = NULL;
+        return;
+    }
+    
+        int sftp_init_result = sftp_init(data->sftp);
+        if (sftp_init_result != SSH_OK) {
+            char msg[512];
+            const char *error_msg = ssh_get_error(data->session);
+            
+            // Special handling for "Channel request subsystem failed"
+            if (error_msg && strstr(error_msg, "subsystem") != NULL) {
+                snprintf(msg, sizeof(msg), 
+                    "SFTP subsystem not available on server.\n\n"
+                    "The server does not support SFTP or the SFTP subsystem is not enabled.\n"
+                    "This is a server configuration issue.\n\n"
+                    "Solution: Use SCP protocol instead (it works with your server).\n"
+                    "The server administrator needs to enable the SFTP subsystem in sshd_config.");
+            } else {
+                snprintf(msg, sizeof(msg), 
+                    "SFTP init error (code %d): %s\n\n"
+                    "Note: Some servers may not support SFTP. Try using SCP protocol instead.", 
+                    sftp_init_result, error_msg ? error_msg : "Unknown error");
+            }
+            
+        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        sftp_free(data->sftp);
+            data->sftp = NULL;
+        ssh_disconnect(data->session);
+        ssh_free(data->session);
+        data->session = NULL;
+        return;
+        }
+    }
+    
+    data->connected = 1;
+    gtk_button_set_label(GTK_BUTTON(data->connect_button), "Disconnect");
+    gtk_label_set_text(GTK_LABEL(data->status_label), "Connected!");
+    refresh_remote_directory(data);
+}
+
+// Disconnect SSH connection
+void disconnect_ssh(AppData *data) {
+    if (!data->connected) return;
+    
+    if (data->sftp) {
+        sftp_free(data->sftp);
+        data->sftp = NULL;
+    }
+    
+    if (data->session) {
+        ssh_disconnect(data->session);
+        ssh_free(data->session);
+        data->session = NULL;
+    }
+    
+    data->connected = 0;
+    gtk_button_set_label(GTK_BUTTON(data->connect_button), "Connect");
+    gtk_label_set_text(GTK_LABEL(data->status_label), "Disconnected");
+    gtk_list_store_clear(data->remote_store);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Helper functions for the progress bar
 void show_progress_bar(AppData *data) {
     gtk_widget_set_visible(data->progress_bar, TRUE);
@@ -106,6 +409,91 @@ void refresh_local_directory(AppData *data) {
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(data->local_store), 0, GTK_SORT_ASCENDING);
     
     gtk_label_set_text(GTK_LABEL(data->status_label), "Local directory refreshed");
+}
+
+// Update remote directory using SFTP
+void refresh_remote_directory(AppData *data) {
+
+    // With SCP, we use SSH commands for directory listing.
+    if (data->use_scp) {
+        refresh_remote_directory_scp(data);
+    } else {
+        refresh_remote_directory_sftp(data);
+    }
+}
+    
+// Update remote directory using SFTP
+void refresh_remote_directory_sftp(AppData *data) {
+    if (!data->connected) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
+        return;
+    }
+    
+    if (!data->sftp) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "SFTP session not available!");
+        return;
+    }
+    
+    gtk_list_store_clear(data->remote_store);
+    
+    const char *path = gtk_entry_get_text(GTK_ENTRY(data->remote_path_entry));
+    if (strlen(path) == 0) {
+        path = ".";
+        gtk_entry_set_text(GTK_ENTRY(data->remote_path_entry), path);
+    }
+    
+    // ".." Add entry if not in the root directory
+    if (strcmp(path, "/") != 0 && strcmp(path, ".") != 0) {
+        GtkTreeIter iter;
+        gtk_list_store_append(data->remote_store, &iter);
+        gtk_list_store_set(data->remote_store, &iter,
+                          0, "..",
+                          1, "Directory",
+                          2, "-",
+                          -1);
+    }
+    
+    sftp_dir dir = sftp_opendir(data->sftp, path);
+    if (!dir) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Error opening: %s", ssh_get_error(data->session));
+        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        return;
+    }
+    
+    sftp_attributes attributes;
+    while ((attributes = sftp_readdir(data->sftp, dir)) != NULL) {
+        if (attributes->name[0] == '.') {
+            sftp_attributes_free(attributes);
+            continue;
+        }
+        
+        GtkTreeIter iter;
+        gtk_list_store_append(data->remote_store, &iter);
+        
+        const char *type = (attributes->type == SSH_FILEXFER_TYPE_DIRECTORY) ? "Directory" : "File";
+        char size_str[64];
+        if (attributes->type == SSH_FILEXFER_TYPE_DIRECTORY) {
+            snprintf(size_str, sizeof(size_str), "-");
+        } else {
+            snprintf(size_str, sizeof(size_str), "%llu", (unsigned long long)attributes->size);
+        }
+        
+        gtk_list_store_set(data->remote_store, &iter,
+                          0, attributes->name,
+                          1, type,
+                          2, size_str,
+                          -1);
+        
+        sftp_attributes_free(attributes);
+    }
+    
+    sftp_closedir(dir);
+    
+    // Reset sorting to default (by filename)
+    gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(data->remote_store), 0, GTK_SORT_ASCENDING);
+    
+    gtk_label_set_text(GTK_LABEL(data->status_label), "Remote directory refreshed");
 }
 
 // Update remote directory using SCP (SSH command)
@@ -235,291 +623,6 @@ void refresh_remote_directory_scp(AppData *data) {
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(data->remote_store), 0, GTK_SORT_ASCENDING);
     
     gtk_label_set_text(GTK_LABEL(data->status_label), "Remote directory refreshed");
-}
-
-// Update remote directory
-void refresh_remote_directory(AppData *data) {
-    if (!data->connected) {
-        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
-        return;
-    }
-    
-    // With SCP, we use SSH commands for directory listing.
-    if (data->use_scp) {
-        refresh_remote_directory_scp(data);
-        return;
-    }
-    
-    if (!data->sftp) {
-        gtk_label_set_text(GTK_LABEL(data->status_label), "SFTP session not available!");
-        return;
-    }
-    
-    gtk_list_store_clear(data->remote_store);
-    
-    const char *path = gtk_entry_get_text(GTK_ENTRY(data->remote_path_entry));
-    if (strlen(path) == 0) {
-        path = ".";
-        gtk_entry_set_text(GTK_ENTRY(data->remote_path_entry), path);
-    }
-    
-    // ".." Add entry if not in the root directory
-    if (strcmp(path, "/") != 0 && strcmp(path, ".") != 0) {
-        GtkTreeIter iter;
-        gtk_list_store_append(data->remote_store, &iter);
-        gtk_list_store_set(data->remote_store, &iter,
-                          0, "..",
-                          1, "Directory",
-                          2, "-",
-                          -1);
-    }
-    
-    sftp_dir dir = sftp_opendir(data->sftp, path);
-    if (!dir) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Error opening: %s", ssh_get_error(data->session));
-        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        return;
-    }
-    
-    sftp_attributes attributes;
-    while ((attributes = sftp_readdir(data->sftp, dir)) != NULL) {
-        if (attributes->name[0] == '.') {
-            sftp_attributes_free(attributes);
-            continue;
-        }
-        
-        GtkTreeIter iter;
-        gtk_list_store_append(data->remote_store, &iter);
-        
-        const char *type = (attributes->type == SSH_FILEXFER_TYPE_DIRECTORY) ? "Directory" : "File";
-        char size_str[64];
-        if (attributes->type == SSH_FILEXFER_TYPE_DIRECTORY) {
-            snprintf(size_str, sizeof(size_str), "-");
-        } else {
-            snprintf(size_str, sizeof(size_str), "%llu", (unsigned long long)attributes->size);
-        }
-        
-        gtk_list_store_set(data->remote_store, &iter,
-                          0, attributes->name,
-                          1, type,
-                          2, size_str,
-                          -1);
-        
-        sftp_attributes_free(attributes);
-    }
-    
-    sftp_closedir(dir);
-    
-    // Reset sorting to default (by filename)
-    gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(data->remote_store), 0, GTK_SORT_ASCENDING);
-    
-    gtk_label_set_text(GTK_LABEL(data->status_label), "Remote directory refreshed");
-}
-
-// Establish an SSH connection
-void connect_ssh(AppData *data) {
-    if (data->connected) {
-        disconnect_ssh(data);
-        return;
-    }
-    
-    const char *host = gtk_entry_get_text(GTK_ENTRY(data->host_entry));
-    const char *user = gtk_entry_get_text(GTK_ENTRY(data->user_entry));
-    const char *password = gtk_entry_get_text(GTK_ENTRY(data->password_entry));
-    const char *port_str = gtk_entry_get_text(GTK_ENTRY(data->port_entry));
-    
-    int port = 22;
-    if (strlen(port_str) > 0) {
-        port = atoi(port_str);
-    }
-    
-    if (strlen(host) == 0 || strlen(user) == 0) {
-        gtk_label_set_text(GTK_LABEL(data->status_label), "Host and user required!");
-        return;
-    }
-    
-    data->session = ssh_new();
-    if (!data->session) {
-        gtk_label_set_text(GTK_LABEL(data->status_label), "Error creating SSH session");
-        return;
-    }
-    
-    ssh_options_set(data->session, SSH_OPTIONS_HOST, host);
-    ssh_options_set(data->session, SSH_OPTIONS_USER, user);
-    ssh_options_set(data->session, SSH_OPTIONS_PORT, &port);
-    
-    if (ssh_connect(data->session) != SSH_OK) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Connection error: %s", ssh_get_error(data->session));
-        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        ssh_free(data->session);
-        data->session = NULL;
-        return;
-    }
-    
-    // Fingerprint verification
-    if (!verify_ssh_fingerprint(data->session, host, port)) {
-        // User disconnected
-        ssh_disconnect(data->session);
-        ssh_free(data->session);
-        data->session = NULL;
-        return;
-    }
-    
-    // Authentication
-    int auth_result = SSH_AUTH_ERROR;
-    const char *key_file_path = gtk_entry_get_text(GTK_ENTRY(data->key_file_entry));
-    
-    // First try key file authentication, if specified.
-    if (strlen(key_file_path) > 0) {
-        ssh_key privkey = NULL;
-        int rc = ssh_pki_import_privkey_file(key_file_path, NULL, NULL, NULL, &privkey);
-        
-        if (rc == SSH_OK && privkey != NULL) {
-            // The key file is not password protected.
-            auth_result = ssh_userauth_publickey(data->session, NULL, privkey);
-            ssh_key_free(privkey);
-        } else if (rc == SSH_EOF || rc == SSH_ERROR) {
-            // The key file may be password protected; try using a password.
-            char *key_password = prompt_key_file_password();
-            if (key_password) {
-                rc = ssh_pki_import_privkey_file(key_file_path, key_password, NULL, NULL, &privkey);
-                if (rc == SSH_OK && privkey != NULL) {
-                    auth_result = ssh_userauth_publickey(data->session, NULL, privkey);
-                    ssh_key_free(privkey);
-                }
-                // Delete password
-                memset(key_password, 0, strlen(key_password));
-                g_free(key_password);
-            }
-        }
-    }
-    
-    // If key file authentication failed or was not specified
-    if (auth_result != SSH_AUTH_SUCCESS) {
-        // If a password has been entered in the field, try directly
-    if (strlen(password) > 0) {
-        auth_result = ssh_userauth_password(data->session, NULL, password);
-    } else {
-            // No password entered - try again without a password (automatic public key authentication)
-        auth_result = ssh_userauth_autopubkey(data->session, NULL);
-            
-            // If that fails, ask for a password.
-            if (auth_result != SSH_AUTH_SUCCESS) {
-                char *dialog_password = prompt_ssh_password();
-                if (dialog_password) {
-                    auth_result = ssh_userauth_password(data->session, NULL, dialog_password);
-                    // Delete password
-                    memset(dialog_password, 0, strlen(dialog_password));
-                    g_free(dialog_password);
-                } else {
-                    // User canceled
-                    gtk_label_set_text(GTK_LABEL(data->status_label), "Connection cancelled");
-                    ssh_disconnect(data->session);
-                    ssh_free(data->session);
-                    data->session = NULL;
-                    return;
-                }
-            }
-        }
-    }
-    
-    if (auth_result != SSH_AUTH_SUCCESS) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Authentication error: %s", ssh_get_error(data->session));
-        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        ssh_disconnect(data->session);
-        ssh_free(data->session);
-        data->session = NULL;
-        return;
-    }
-    
-    // Read protocol selection
-    int protocol_index = gtk_combo_box_get_active(GTK_COMBO_BOX(data->protocol_combo));
-    data->use_scp = (protocol_index == 1); // 0 = SFTP, 1 = SCP
-    
-    // Create an SFTP session only if SFTP was selected.
-    if (!data->use_scp) {
-        // Check if the SSH session is still valid.
-        if (!data->session || ssh_is_connected(data->session) == 0) {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "SSH session not connected. Cannot create SFTP session.");
-            gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-            if (data->session) {
-                ssh_disconnect(data->session);
-                ssh_free(data->session);
-                data->session = NULL;
-            }
-            return;
-        }
-        
-    data->sftp = sftp_new(data->session);
-    if (!data->sftp) {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "Error creating SFTP session: %s", ssh_get_error(data->session));
-            gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        ssh_disconnect(data->session);
-        ssh_free(data->session);
-        data->session = NULL;
-        return;
-    }
-    
-        int sftp_init_result = sftp_init(data->sftp);
-        if (sftp_init_result != SSH_OK) {
-            char msg[512];
-            const char *error_msg = ssh_get_error(data->session);
-            
-            // Special handling for "Channel request subsystem failed"
-            if (error_msg && strstr(error_msg, "subsystem") != NULL) {
-                snprintf(msg, sizeof(msg), 
-                    "SFTP subsystem not available on server.\n\n"
-                    "The server does not support SFTP or the SFTP subsystem is not enabled.\n"
-                    "This is a server configuration issue.\n\n"
-                    "Solution: Use SCP protocol instead (it works with your server).\n"
-                    "The server administrator needs to enable the SFTP subsystem in sshd_config.");
-            } else {
-                snprintf(msg, sizeof(msg), 
-                    "SFTP init error (code %d): %s\n\n"
-                    "Note: Some servers may not support SFTP. Try using SCP protocol instead.", 
-                    sftp_init_result, error_msg ? error_msg : "Unknown error");
-            }
-            
-        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        sftp_free(data->sftp);
-            data->sftp = NULL;
-        ssh_disconnect(data->session);
-        ssh_free(data->session);
-        data->session = NULL;
-        return;
-        }
-    }
-    
-    data->connected = 1;
-    gtk_button_set_label(GTK_BUTTON(data->connect_button), "Disconnect");
-    gtk_label_set_text(GTK_LABEL(data->status_label), "Connected!");
-    refresh_remote_directory(data);
-}
-
-// Disconnect SSH connection
-void disconnect_ssh(AppData *data) {
-    if (!data->connected) return;
-    
-    if (data->sftp) {
-        sftp_free(data->sftp);
-        data->sftp = NULL;
-    }
-    
-    if (data->session) {
-        ssh_disconnect(data->session);
-        ssh_free(data->session);
-        data->session = NULL;
-    }
-    
-    data->connected = 0;
-    gtk_button_set_label(GTK_BUTTON(data->connect_button), "Connect");
-    gtk_label_set_text(GTK_LABEL(data->status_label), "Disconnected");
-    gtk_list_store_clear(data->remote_store);
 }
 
 // Callback for connection button
