@@ -4,7 +4,7 @@
 #define VERSION "1.2.1"
 
 // Global Application Data
-static AppData *app_data = NULL;
+extern AppData *app_data = NULL;
 
 // Establish an SSH connection
 void connect_ssh(AppData *data) {
@@ -65,13 +65,17 @@ void connect_ssh(AppData *data) {
         ssh_key privkey = NULL;
         int rc = ssh_pki_import_privkey_file(key_file_path, NULL, NULL, NULL, &privkey);
         
-        if (rc == SSH_OK && privkey != NULL) {
-            // The key file is not password protected.
+        if (rc == SSH_OK && privkey != NULL) {  // The key file is not password protected.
             auth_result = ssh_userauth_publickey(data->session, NULL, privkey);
             ssh_key_free(privkey);
-        } else if (rc == SSH_EOF || rc == SSH_ERROR) {
-            // The key file may be password protected; try using a password.
-            char *key_password = prompt_key_file_password();
+        } else if (rc == SSH_EOF) { //error reading the specified key file
+            char msg[256];
+            snprintf(msg, sizeof(msg), "Key file does not exist or permission denied");
+            gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+            ssh_free(data->session);
+            data->session = NULL;
+        } else {  // The key file may be password protected; try using a password.
+            char *key_password = prompt_password("Key File Password", "The key file is password protected.\nPlease enter the password:", FALSE);
             if (key_password) {
                 rc = ssh_pki_import_privkey_file(key_file_path, key_password, NULL, NULL, &privkey);
                 if (rc == SSH_OK && privkey != NULL) {
@@ -96,7 +100,7 @@ void connect_ssh(AppData *data) {
             
             // If that fails, ask for a password.
             if (auth_result != SSH_AUTH_SUCCESS) {
-                char *dialog_password = prompt_ssh_password();
+                char *dialog_password = prompt_password("SSH Password","Please enter the SSH password:", FALSE);
                 if (dialog_password) {
                     auth_result = ssh_userauth_password(data->session, NULL, dialog_password);
                     // Delete password
@@ -120,96 +124,43 @@ void connect_ssh(AppData *data) {
         if (strlen(password) > 0) {
             auth_result = ssh_userauth_kbdint(data->session, NULL, NULL);
             while (auth_result == SSH_AUTH_INFO) {
-                int prompts;
-                prompts = ssh_userauth_kbdint_getnprompts(data->session);
-                char buffer[128];
-                int i;
+                unsigned int prompts = ssh_userauth_kbdint_getnprompts(data->session);
+                unsigned int i;
 
                 for (i = 0; i < prompts; i++) {
-                    const char *answer;
-                    const char *prompt;
+		    int setanswer_result;
+                    char *answer;
+                    char *prompt;
                     char echo;
-
                     prompt = ssh_userauth_kbdint_getprompt(data->session, i, &echo);
+
                     if (prompt == NULL) {
                         break;
                     }
-
-                    // TODO: Prompt should be printed. It should be managed in the GUI. Let's not worry about it for now.
-                    if (echo) {
-                        char *p;
-                        
-                        printf("prompt: %s", prompt);
-
-                        if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
-                            auth_result = SSH_AUTH_ERROR;
-                            return;
-                        }
-
-                        buffer[sizeof(buffer) - 1] = '\0';
-                        if ((p = strchr(buffer, '\n'))) {
-                            *p = '\0';
-                        }
-
-                        if (ssh_userauth_kbdint_setanswer(data->session, i, buffer) < 0) {
-                            auth_result = SSH_AUTH_ERROR;
-                            return;
-                        }
-
-                        memset(buffer, 0, strlen(buffer));
-                    } else {
-                        // TODO: Delete this
-                        printf ("Password: %s\nPrompt: %s\n", password, prompt);
-                        // It's asking the password
+                    
+                    if (echo) { // Prompt should be printed.
+                        answer = prompt_password("Prompt",prompt, TRUE);
+                    } else { // It's asking for the password
                         if (password && strstr(prompt, "Password")) {
                             answer = password;
-                        // TODO: It's asking for something else. It should be managed in the GUI. Let's not worry about it for now.
                         } else {
-                            buffer[0] = '\0';
-
-                            if (ssh_getpass(prompt, buffer, sizeof(buffer), 0, 0) < 0) {
-                                return SSH_AUTH_ERROR;
-                            }
-                            answer = buffer;
+                            answer = prompt_password("Authentication information","Please enter the required information:", FALSE);
                         }
-                        // TODO: Delete this
-                        printf ("Answer: %s\n", answer);
-                        auth_result = ssh_userauth_kbdint_setanswer(data->session, i, answer);
-                        memset(buffer, 0, sizeof(buffer));
-                        if (auth_result < 0) {
-                            auth_result = SSH_AUTH_ERROR;
-                            return;
-                        }
+                    }
+                    setanswer_result = ssh_userauth_kbdint_setanswer(data->session, i, answer);
+                    // Delete password
+                    memset(answer, 0, strlen(answer));
+                    g_free(answer);
+                    if (setanswer_result < 0) {
+                        auth_result = SSH_AUTH_ERROR;
                     }
                 }
                 auth_result=ssh_userauth_kbdint(data->session,NULL,NULL);
-                // TODO: Delete this
-                printf ("auth_result: %d\n", auth_result);
-            }
-        } else {
-            // No password entered - try again without a password (automatic public key authentication)
-            auth_result = ssh_userauth_autopubkey(data->session, NULL);
-            
-            // If that fails, ask for a password.
-            if (auth_result != SSH_AUTH_SUCCESS) {
-                char *dialog_password = prompt_ssh_password();
-                if (dialog_password) {
-                    auth_result = ssh_userauth_password(data->session, NULL, dialog_password);
-                    // Delete password
-                    memset(dialog_password, 0, strlen(dialog_password));
-                    g_free(dialog_password);
-                } else {
-                    // User canceled
-                    gtk_label_set_text(GTK_LABEL(data->status_label), "Connection cancelled");
-                    ssh_disconnect(data->session);
-                    ssh_free(data->session);
-                    data->session = NULL;
-                    return;
-                }
             }
         }
     }
     
+    // All authentication attempts failed, show error message
     if (auth_result != SSH_AUTH_SUCCESS) {
         char msg[256];
         snprintf(msg, sizeof(msg), "Authentication error: %s", ssh_get_error(data->session));
@@ -220,12 +171,13 @@ void connect_ssh(AppData *data) {
         return;
     }
     
+    // Authentication successfult
     // Read protocol selection
     int protocol_index = gtk_combo_box_get_active(GTK_COMBO_BOX(data->protocol_combo));
-    data->use_scp = (protocol_index == 1); // 0 = SFTP, 1 = SCP
+    data->protocol = protocol_index; // 0 = SFTP, 1 = SCP
     
     // Create an SFTP session only if SFTP was selected.
-    if (!data->use_scp) {
+    if (data->protocol == 0) {
         // Check if the SSH session is still valid.
         if (!data->session || ssh_is_connected(data->session) == 0) {
             char msg[256];
@@ -239,16 +191,16 @@ void connect_ssh(AppData *data) {
             return;
         }
         
-    data->sftp = sftp_new(data->session);
-    if (!data->sftp) {
+        data->sftp = sftp_new(data->session);
+        if (!data->sftp) {
             char msg[256];
             snprintf(msg, sizeof(msg), "Error creating SFTP session: %s", ssh_get_error(data->session));
             gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        ssh_disconnect(data->session);
-        ssh_free(data->session);
-        data->session = NULL;
-        return;
-    }
+            ssh_disconnect(data->session);
+            ssh_free(data->session);
+            data->session = NULL;
+            return;
+        }
     
         int sftp_init_result = sftp_init(data->sftp);
         if (sftp_init_result != SSH_OK) {
@@ -265,18 +217,18 @@ void connect_ssh(AppData *data) {
                     "The server administrator needs to enable the SFTP subsystem in sshd_config.");
             } else {
                 snprintf(msg, sizeof(msg), 
-                    "SFTP init error (code %d): %s\n\n"
-                    "Note: Some servers may not support SFTP. Try using SCP protocol instead.", 
-                    sftp_init_result, error_msg ? error_msg : "Unknown error");
+                    "SFTP init error (code %d): %s\n\nNote: Some servers may not support SFTP. Try using SCP protocol instead.", 
+                    sftp_init_result,
+		    error_msg ? error_msg : "Unknown error");
             }
             
-        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        sftp_free(data->sftp);
+            gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+            sftp_free(data->sftp);
             data->sftp = NULL;
-        ssh_disconnect(data->session);
-        ssh_free(data->session);
-        data->session = NULL;
-        return;
+            ssh_disconnect(data->session);
+            ssh_free(data->session);
+            data->session = NULL;
+            return;
         }
     }
     
@@ -304,48 +256,8 @@ void disconnect_ssh(AppData *data) {
     data->connected = 0;
     gtk_button_set_label(GTK_BUTTON(data->connect_button), "Connect");
     gtk_label_set_text(GTK_LABEL(data->status_label), "Disconnected");
+    gtk_entry_set_text(GTK_ENTRY(data->remote_path_entry), "");
     gtk_list_store_clear(data->remote_store);
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Helper functions for the progress bar
-void show_progress_bar(AppData *data) {
-    gtk_widget_set_visible(data->progress_bar, TRUE);
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(data->progress_bar), 0.0);
-    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(data->progress_bar), "");
-}
-
-void hide_progress_bar(AppData *data) {
-    gtk_widget_set_visible(data->progress_bar, FALSE);
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(data->progress_bar), 0.0);
-}
-
-void update_progress_bar(AppData *data, double fraction, const char *text) {
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(data->progress_bar), fraction);
-    if (text) {
-        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(data->progress_bar), text);
-    }
-    // Update GUI
-    while (gtk_events_pending()) {
-        gtk_main_iteration();
-    }
-}
-
-// Update callback for local file directory
-void on_local_refresh_clicked(GtkWidget *widget, gpointer data) {
-    AppData *app = (AppData *)data;
-    refresh_local_directory(app);
-}
-
-// Update callback for remote file directory
-void on_remote_refresh_clicked(GtkWidget *widget, gpointer data) {
-    AppData *app = (AppData *)data;
-    if (app->connected) {
-        refresh_remote_directory(app);
-    } else {
-        gtk_label_set_text(GTK_LABEL(app->status_label), "Not connected!");
-    }
 }
 
 // Update local directory
@@ -359,16 +271,16 @@ void refresh_local_directory(AppData *data) {
         gtk_entry_set_text(GTK_ENTRY(data->local_path_entry), path);
     }
     
-    // ".." Add entry if not in the root directory
-    if (strcmp(path, "/") != 0) {
-        GtkTreeIter iter;
-        gtk_list_store_append(data->local_store, &iter);
-        gtk_list_store_set(data->local_store, &iter,
-                          0, "..",
-                          1, "Directory",
-                          2, "-",
-                          -1);
-    }
+    // Add ".." entry if not in the root directory
+    //if (strcmp(path, "/") != 0) {
+    //    GtkTreeIter iter;
+    //    gtk_list_store_append(data->local_store, &iter);
+    //    gtk_list_store_set(data->local_store, &iter,
+    //                      0, "..",
+    //                      1, "Directory",
+    //                      2, "-",
+    //                      -1);
+    //}
     
     DIR *dir = opendir(path);
     if (!dir) {
@@ -378,7 +290,8 @@ void refresh_local_directory(AppData *data) {
     
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
+        // Do not show hidden files or directories
+        //if (entry->d_name[0] == '.') continue;
         
         char full_path[1024];
         snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
@@ -411,14 +324,12 @@ void refresh_local_directory(AppData *data) {
     gtk_label_set_text(GTK_LABEL(data->status_label), "Local directory refreshed");
 }
 
-// Update remote directory using SFTP
+// Update remote directory
 void refresh_remote_directory(AppData *data) {
-
-    // With SCP, we use SSH commands for directory listing.
-    if (data->use_scp) {
-        refresh_remote_directory_scp(data);
-    } else {
+    if (data->protocol==0) {
         refresh_remote_directory_sftp(data);
+    } else if (data->protocol==1) {     // With SCP, we use SSH commands for directory listing.
+        refresh_remote_directory_scp(data);
     }
 }
     
@@ -437,20 +348,19 @@ void refresh_remote_directory_sftp(AppData *data) {
     gtk_list_store_clear(data->remote_store);
     
     const char *path = gtk_entry_get_text(GTK_ENTRY(data->remote_path_entry));
+    // Initialize to the default directory, usually user's home
     if (strlen(path) == 0) {
-        path = ".";
-        gtk_entry_set_text(GTK_ENTRY(data->remote_path_entry), path);
-    }
-    
-    // ".." Add entry if not in the root directory
-    if (strcmp(path, "/") != 0 && strcmp(path, ".") != 0) {
-        GtkTreeIter iter;
-        gtk_list_store_append(data->remote_store, &iter);
-        gtk_list_store_set(data->remote_store, &iter,
-                          0, "..",
-                          1, "Directory",
-                          2, "-",
-                          -1);
+        path = sftp_canonicalize_path(data->sftp, ".");
+        
+        if (path != NULL) {
+            printf("Default path: %s\n", path);
+            // Free the dynamically allocated string returned by libssh
+            gtk_entry_set_text(GTK_ENTRY(data->remote_path_entry), path);
+            //ssh_string_free_char(path);
+        } else {
+            printf("Canonicalization failed: %d\n", sftp_get_error(data->sftp));
+            return;
+        }
     }
     
     sftp_dir dir = sftp_opendir(data->sftp, path);
@@ -463,10 +373,11 @@ void refresh_remote_directory_sftp(AppData *data) {
     
     sftp_attributes attributes;
     while ((attributes = sftp_readdir(data->sftp, dir)) != NULL) {
-        if (attributes->name[0] == '.') {
-            sftp_attributes_free(attributes);
-            continue;
-        }
+        // Do not show hidden files and directories
+        //if (attributes->name[0] == '.') {
+        //    sftp_attributes_free(attributes);
+        //    continue;
+        //}
         
         GtkTreeIter iter;
         gtk_list_store_append(data->remote_store, &iter);
@@ -625,17 +536,228 @@ void refresh_remote_directory_scp(AppData *data) {
     gtk_label_set_text(GTK_LABEL(data->status_label), "Remote directory refreshed");
 }
 
-// Callback for connection button
-void on_connect_clicked(GtkWidget *widget, gpointer data) {
-    AppData *app = (AppData *)data;
-    if (app->connected) {
-        disconnect_ssh(app);
-    } else {
-        connect_ssh(app);
+// Create local directory
+void create_local_directory(AppData *data, const char *dirname) {
+    const char *local_path_text = gtk_entry_get_text(GTK_ENTRY(data->local_path_entry));
+    char full_path[2048];
+    snprintf(full_path, sizeof(full_path), "%s/%s", local_path_text, dirname);
+    
+    if (mkdir(full_path, 0755) != 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Error creating directory: %s", strerror(errno));
+        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        return;
+    }
+    
+    refresh_local_directory(data);
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Created directory: %s", full_path);
+    gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+}
+
+// Create remote directory
+void create_remote_directory(AppData *data, const char *dirname) {
+    if (data->protocol == 0) {
+        create_remote_directory_sftp(data, dirname);
+    } else if (data->protocol == 1) {
+        create_remote_directory_scp(data, dirname);
     }
 }
 
-// SCP: Copy file to remote
+// Create remote directory using SFTP
+void create_remote_directory_sftp(AppData *data, const char *dirname) {
+    if (!data->connected || !data->session) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
+        return;
+    }
+    
+    const char *remote_path_text = gtk_entry_get_text(GTK_ENTRY(data->remote_path_entry));
+    char full_path[2048];
+    snprintf(full_path, sizeof(full_path), "%s/%s", remote_path_text, dirname);
+    
+    if (sftp_mkdir(data->sftp, full_path, 0755) != SSH_OK) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Error creating remote directory: %s", ssh_get_error(data->session));
+        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        return;
+    }
+    
+    refresh_remote_directory(data);
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Created directory: %s", full_path);
+    gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+}
+
+// Create remote directory using SCP
+void create_remote_directory_scp(AppData *data, const char *dirname) {
+    if (!data->connected || !data->session) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
+        return;
+    }
+    
+    const char *remote_path_text = gtk_entry_get_text(GTK_ENTRY(data->remote_path_entry));
+    char full_path[2048];
+    snprintf(full_path, sizeof(full_path), "%s/%s", remote_path_text, dirname);
+    
+    // SCP mode: Use SSH command
+    ssh_channel channel = ssh_channel_new(data->session);
+    if (!channel) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Error creating channel");
+        return;
+    }
+    
+    if (ssh_channel_open_session(channel) != SSH_OK) {
+        ssh_channel_free(channel);
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Error opening channel");
+        return;
+    }
+    
+    char command[2048];
+    snprintf(command, sizeof(command), "mkdir -p '%s'", full_path);
+    
+    if (ssh_channel_request_exec(channel, command) != SSH_OK) {
+        ssh_channel_close(channel);
+        ssh_channel_free(channel);
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Error creating remote directory");
+        return;
+    }
+    
+    ssh_channel_send_eof(channel);
+    ssh_channel_close(channel);
+    ssh_channel_free(channel);
+    
+    refresh_remote_directory(data);
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Created directory: %s", full_path);
+    gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+}
+
+// Copy file to remote
+void copy_file_to_remote(AppData *data, const char *local_path, const char *remote_path) {
+    if (data->protocol==0) {
+        copy_file_to_remote_sftp(data, local_path, remote_path);
+    } else if (data->protocol==1) {
+        copy_file_to_remote_scp(data, local_path, remote_path);
+    }
+}
+
+// Copy file to remote using SFTP
+void copy_file_to_remote_sftp(AppData *data, const char *local_path, const char *remote_path) {
+    if (data->copy_aborted) {
+        return;
+    }
+    
+    // SFTP implementation
+    if (!data->connected || !data->sftp) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
+        return;
+    }
+    
+    // Check if local file exists
+    struct stat local_st;
+    if (stat(local_path, &local_st) != 0 || !S_ISREG(local_st.st_mode)) {
+        // File no longer exists, update GUI and continue.
+        refresh_local_directory(data);
+        return;
+    }
+    
+    // Check if remote file exists
+    sftp_attributes remote_attrs = sftp_stat(data->sftp, remote_path);
+    if (remote_attrs && !data->overwrite_all && !data->skip_all) {
+        // Conflict: File already exists
+        struct stat local_st;
+        if (stat(local_path, &local_st) == 0 && S_ISREG(local_st.st_mode)) {
+            char local_size_str[64];
+            char local_date_str[64];
+            char remote_size_str[64];
+            char remote_date_str[64];
+            
+            format_file_size(local_size_str, sizeof(local_size_str), local_st.st_size);
+            format_file_date(local_date_str, sizeof(local_date_str), local_st.st_mtime);
+            format_file_size(remote_size_str, sizeof(remote_size_str), remote_attrs->size);
+            format_file_date(remote_date_str, sizeof(remote_date_str), remote_attrs->mtime);
+            
+            const char *filename = strrchr(remote_path, '/');
+            filename = filename ? filename + 1 : remote_path;
+            
+            ConflictResponse response = show_conflict_dialog(filename, local_size_str, local_date_str, remote_size_str, remote_date_str);
+            
+            if (response == CONFLICT_SKIP || response == CONFLICT_SKIP_ALL) {
+                sftp_attributes_free(remote_attrs);
+                if (response == CONFLICT_SKIP_ALL) {
+                    data->skip_all = 1;
+                }
+                return;
+            } else if (response == CONFLICT_OVERWRITE_ALL) {
+                data->overwrite_all = 1;
+            } else if (response == CONFLICT_ABORT) {
+                data->copy_aborted = 1;
+                sftp_attributes_free(remote_attrs);
+                return;
+            }
+        }
+    }
+    if (remote_attrs) {
+        sftp_attributes_free(remote_attrs);
+    }
+    
+    FILE *local_file = fopen(local_path, "rb");
+    if (!local_file) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Could not open local file");
+        return;
+    }
+    
+    // Determine file size
+    fseek(local_file, 0, SEEK_END);
+    long file_size = ftell(local_file);
+    fseek(local_file, 0, SEEK_SET);
+    
+    sftp_file remote_file = sftp_open(data->sftp, remote_path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (!remote_file) {
+        fclose(local_file);
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Error opening remote file: %s", ssh_get_error(data->session));
+        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        return;
+    }
+    
+    // Show progress bar
+    show_progress_bar(data);
+    char progress_text[256];
+    snprintf(progress_text, sizeof(progress_text), "Copying... 0 / %ld Bytes", file_size);
+    update_progress_bar(data, 0.0, progress_text);
+    
+    char buffer[8192];
+    size_t bytes_read;
+    ssize_t bytes_written;
+    long total_written = 0;
+    
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), local_file)) > 0) {
+        bytes_written = sftp_write(remote_file, buffer, bytes_read);
+        if (bytes_written != (ssize_t)bytes_read) {
+            gtk_label_set_text(GTK_LABEL(data->status_label), "Error writing");
+            hide_progress_bar(data);
+            break;
+        }
+        
+        total_written += bytes_written;
+        // Update progress
+        if (file_size > 0) {
+            double fraction = (double)total_written / (double)file_size;
+            snprintf(progress_text, sizeof(progress_text), "Copying... %ld / %ld Bytes (%.1f%%)", 
+                     total_written, file_size, fraction * 100.0);
+            update_progress_bar(data, fraction, progress_text);
+        }
+    }
+    
+    fclose(local_file);
+    sftp_close(remote_file);
+    hide_progress_bar(data);
+    gtk_label_set_text(GTK_LABEL(data->status_label), "File copied!");
+    refresh_remote_directory(data);
+}
+
+// Copy file to remote using SCP
 void copy_file_to_remote_scp(AppData *data, const char *local_path, const char *remote_path) {
     if (data->copy_aborted) {
         return;
@@ -801,7 +923,129 @@ void copy_file_to_remote_scp(AppData *data, const char *local_path, const char *
     gtk_label_set_text(GTK_LABEL(data->status_label), "File copied!");
 }
 
-// SCP: Copy file from remote
+// Copy file from remote
+void copy_file_from_remote(AppData *data, const char *remote_path, const char *local_path) {
+    if (data->protocol == 0) {
+        copy_file_from_remote_sftp(data, remote_path, local_path);
+    } else if (data->protocol == 1) {
+        copy_file_from_remote_scp(data, remote_path, local_path);
+    }
+}
+
+// Copy file from remote using sftp
+void copy_file_from_remote_sftp(AppData *data, const char *remote_path, const char *local_path) {
+    if (data->copy_aborted) {
+        return;
+    }
+    
+    // SFTP implementation
+    if (!data->connected || !data->sftp) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
+        return;
+    }
+    
+    // Check if remote file exists
+    sftp_attributes remote_attrs = sftp_stat(data->sftp, remote_path);
+    if (!remote_attrs) {
+        // File no longer exists, update GUI and continue.
+        refresh_remote_directory(data);
+        return;
+    }
+    
+    // Check if local file exists
+    struct stat local_st;
+    int local_exists = (stat(local_path, &local_st) == 0 && S_ISREG(local_st.st_mode));
+    if (local_exists && remote_attrs && !data->overwrite_all && !data->skip_all) {
+        // Conflict: File already exists
+        char local_size_str[64];
+        char local_date_str[64];
+        char remote_size_str[64];
+        char remote_date_str[64];
+        
+        format_file_size(local_size_str, sizeof(local_size_str), local_st.st_size);
+        format_file_date(local_date_str, sizeof(local_date_str), local_st.st_mtime);
+        format_file_size(remote_size_str, sizeof(remote_size_str), remote_attrs->size);
+        format_file_date(remote_date_str, sizeof(remote_date_str), remote_attrs->mtime);
+        
+        const char *filename = strrchr(local_path, '/');
+        filename = filename ? filename + 1 : local_path;
+        
+        ConflictResponse response = show_conflict_dialog(filename, remote_size_str, remote_date_str, local_size_str, local_date_str);
+        
+        if (response == CONFLICT_SKIP || response == CONFLICT_SKIP_ALL) {
+            sftp_attributes_free(remote_attrs);
+            if (response == CONFLICT_SKIP_ALL) {
+                data->skip_all = 1;
+            }
+            return;
+        } else if (response == CONFLICT_OVERWRITE_ALL) {
+            data->overwrite_all = 1;
+        } else if (response == CONFLICT_ABORT) {
+            data->copy_aborted = 1;
+            sftp_attributes_free(remote_attrs);
+            return;
+        }
+    }
+    
+    sftp_file remote_file = sftp_open(data->sftp, remote_path, O_RDONLY, 0);
+    if (!remote_file) {
+        if (remote_attrs) sftp_attributes_free(remote_attrs);
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Error opening: %s", ssh_get_error(data->session));
+        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        return;
+    }
+    
+    // Determine file size
+    sftp_attributes attrs = sftp_fstat(remote_file);
+    uint64_t file_size = attrs ? attrs->size : 0;
+    if (attrs) sftp_attributes_free(attrs);
+    if (remote_attrs) sftp_attributes_free(remote_attrs);
+    
+    FILE *local_file = fopen(local_path, "wb");
+    if (!local_file) {
+        sftp_close(remote_file);
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Could not create local file");
+        return;
+    }
+    
+    // Show progress bar
+    show_progress_bar(data);
+    char progress_text[256];
+    snprintf(progress_text, sizeof(progress_text), "Loading... 0 / %llu Bytes", (unsigned long long)file_size);
+    update_progress_bar(data, 0.0, progress_text);
+    
+    char buffer[8192];
+    ssize_t bytes_read;
+    size_t bytes_written;
+    uint64_t total_read = 0;
+    
+    while ((bytes_read = sftp_read(remote_file, buffer, sizeof(buffer))) > 0) {
+        bytes_written = fwrite(buffer, 1, bytes_read, local_file);
+        if (bytes_written != (size_t)bytes_read) {
+            gtk_label_set_text(GTK_LABEL(data->status_label), "Error writing");
+            hide_progress_bar(data);
+            break;
+        }
+        
+        total_read += bytes_read;
+        // Update progress
+        if (file_size > 0) {
+            double fraction = (double)total_read / (double)file_size;
+            snprintf(progress_text, sizeof(progress_text), "Loading... %llu / %llu Bytes (%.1f%%)", 
+                     (unsigned long long)total_read, (unsigned long long)file_size, fraction * 100.0);
+            update_progress_bar(data, fraction, progress_text);
+        }
+    }
+    
+    sftp_close(remote_file);
+    fclose(local_file);
+    hide_progress_bar(data);
+    gtk_label_set_text(GTK_LABEL(data->status_label), "File copied!");
+    refresh_local_directory(data);
+}
+
+// Copy file from remote using SCP
 void copy_file_from_remote_scp(AppData *data, const char *remote_path, const char *local_path) {
     if (data->copy_aborted) {
         return;
@@ -1000,340 +1244,16 @@ void copy_file_from_remote_scp(AppData *data, const char *remote_path, const cha
     refresh_local_directory(data);
 }
 
-// Show conflict dialogue
-ConflictResponse show_conflict_dialog(const char *filename, const char *local_size, const char *local_date, const char *remote_size, const char *remote_date) {
-    GtkWidget *dialog = gtk_dialog_new_with_buttons("File Conflict",
-                                                     NULL,
-                                                     GTK_DIALOG_MODAL,
-                                                     "Overwrite", CONFLICT_OVERWRITE,
-                                                     "Overwrite All", CONFLICT_OVERWRITE_ALL,
-                                                     "Skip", CONFLICT_SKIP,
-                                                     "Skip All", CONFLICT_SKIP_ALL,
-                                                     "Abort", CONFLICT_ABORT,
-                                                     NULL);
-    
-    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    gtk_container_set_border_width(GTK_CONTAINER(content), 10);
-    
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    
-    char msg[512];
-    snprintf(msg, sizeof(msg), "File already exists:\n%s", filename);
-    GtkWidget *label = gtk_label_new(msg);
-    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
-    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
-    
-    // Local file info
-    char local_info[256];
-    snprintf(local_info, sizeof(local_info), "Local:  %s  %s", local_size, local_date);
-    label = gtk_label_new(local_info);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
-    
-    // Remote File Info
-    char remote_info[256];
-    snprintf(remote_info, sizeof(remote_info), "Remote: %s  %s", remote_size, remote_date);
-    label = gtk_label_new(remote_info);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
-    
-    gtk_container_add(GTK_CONTAINER(content), vbox);
-    gtk_widget_show_all(dialog);
-    
-    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
-    
-    return (ConflictResponse)response;
-}
-
-// Show directory conflict dialog
-ConflictResponse show_directory_conflict_dialog(const char *dirname) {
-    GtkWidget *dialog = gtk_dialog_new_with_buttons("Directory Conflict",
-                                                     NULL,
-                                                     GTK_DIALOG_MODAL,
-                                                     "Overwrite", CONFLICT_OVERWRITE,
-                                                     "Overwrite All", CONFLICT_OVERWRITE_ALL,
-                                                     "Skip", CONFLICT_SKIP,
-                                                     "Skip All", CONFLICT_SKIP_ALL,
-                                                     "Abort", CONFLICT_ABORT,
-                                                     NULL);
-    
-    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    gtk_container_set_border_width(GTK_CONTAINER(content), 10);
-    
-    char msg[512];
-    snprintf(msg, sizeof(msg), "Directory already exists:\n%s", dirname);
-    GtkWidget *label = gtk_label_new(msg);
-    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
-    gtk_container_add(GTK_CONTAINER(content), label);
-    
-    gtk_widget_show_all(dialog);
-    
-    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
-    
-    return (ConflictResponse)response;
-}
-
-// Format File size
-void format_file_size(char *buffer, size_t size, uint64_t bytes) {
-    if (bytes < 1024) {
-        snprintf(buffer, size, "%llu B", (unsigned long long)bytes);
-    } else if (bytes < 1024 * 1024) {
-        snprintf(buffer, size, "%.1f KB", bytes / 1024.0);
-    } else if (bytes < 1024ULL * 1024 * 1024) {
-        snprintf(buffer, size, "%.1f MB", bytes / (1024.0 * 1024.0));
-    } else {
-        snprintf(buffer, size, "%.1f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+// Recursive copying of a directory to a remote location
+void copy_directory_to_remote(AppData *data, const char *local_path, const char *remote_path) {
+    if (data->protocol == 0) {
+        copy_directory_to_remote_sftp(data, local_path, remote_path);
+    } else if (data->protocol == 1) {
+        copy_directory_to_remote_scp(data, local_path, remote_path);
     }
 }
 
-// Date Format
-void format_file_date(char *buffer, size_t size, time_t mtime) {
-    struct tm *tm_info = localtime(&mtime);
-    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", tm_info);
-}
-
-// Copy file to remote
-void copy_file_to_remote(AppData *data, const char *local_path, const char *remote_path) {
-    if (data->copy_aborted) {
-        return;
-    }
-    
-    if (data->use_scp) {
-        copy_file_to_remote_scp(data, local_path, remote_path);
-        return;
-    }
-    
-    // SFTP implementation
-    if (!data->connected || !data->sftp) {
-        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
-        return;
-    }
-    
-    // Check if local file exists
-    struct stat local_st;
-    if (stat(local_path, &local_st) != 0 || !S_ISREG(local_st.st_mode)) {
-        // File no longer exists, update GUI and continue.
-        refresh_local_directory(data);
-        return;
-    }
-    
-    // Check if remote file exists
-    sftp_attributes remote_attrs = sftp_stat(data->sftp, remote_path);
-    if (remote_attrs && !data->overwrite_all && !data->skip_all) {
-        // Conflict: File already exists
-        struct stat local_st;
-        if (stat(local_path, &local_st) == 0 && S_ISREG(local_st.st_mode)) {
-            char local_size_str[64];
-            char local_date_str[64];
-            char remote_size_str[64];
-            char remote_date_str[64];
-            
-            format_file_size(local_size_str, sizeof(local_size_str), local_st.st_size);
-            format_file_date(local_date_str, sizeof(local_date_str), local_st.st_mtime);
-            format_file_size(remote_size_str, sizeof(remote_size_str), remote_attrs->size);
-            format_file_date(remote_date_str, sizeof(remote_date_str), remote_attrs->mtime);
-            
-            const char *filename = strrchr(remote_path, '/');
-            filename = filename ? filename + 1 : remote_path;
-            
-            ConflictResponse response = show_conflict_dialog(filename, local_size_str, local_date_str, remote_size_str, remote_date_str);
-            
-            if (response == CONFLICT_SKIP || response == CONFLICT_SKIP_ALL) {
-                sftp_attributes_free(remote_attrs);
-                if (response == CONFLICT_SKIP_ALL) {
-                    data->skip_all = 1;
-                }
-                return;
-            } else if (response == CONFLICT_OVERWRITE_ALL) {
-                data->overwrite_all = 1;
-            } else if (response == CONFLICT_ABORT) {
-                data->copy_aborted = 1;
-                sftp_attributes_free(remote_attrs);
-                return;
-            }
-        }
-    }
-    if (remote_attrs) {
-        sftp_attributes_free(remote_attrs);
-    }
-    
-    FILE *local_file = fopen(local_path, "rb");
-    if (!local_file) {
-        gtk_label_set_text(GTK_LABEL(data->status_label), "Could not open local file");
-        return;
-    }
-    
-    // Determine file size
-    fseek(local_file, 0, SEEK_END);
-    long file_size = ftell(local_file);
-    fseek(local_file, 0, SEEK_SET);
-    
-    sftp_file remote_file = sftp_open(data->sftp, remote_path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-    if (!remote_file) {
-        fclose(local_file);
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Error opening remote file: %s", ssh_get_error(data->session));
-        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        return;
-    }
-    
-    // Show progress bar
-    show_progress_bar(data);
-    char progress_text[256];
-    snprintf(progress_text, sizeof(progress_text), "Copying... 0 / %ld Bytes", file_size);
-    update_progress_bar(data, 0.0, progress_text);
-    
-    char buffer[8192];
-    size_t bytes_read;
-    ssize_t bytes_written;
-    long total_written = 0;
-    
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), local_file)) > 0) {
-        bytes_written = sftp_write(remote_file, buffer, bytes_read);
-        if (bytes_written != (ssize_t)bytes_read) {
-            gtk_label_set_text(GTK_LABEL(data->status_label), "Error writing");
-            hide_progress_bar(data);
-            break;
-        }
-        
-        total_written += bytes_written;
-        // Update progress
-        if (file_size > 0) {
-            double fraction = (double)total_written / (double)file_size;
-            snprintf(progress_text, sizeof(progress_text), "Copying... %ld / %ld Bytes (%.1f%%)", 
-                     total_written, file_size, fraction * 100.0);
-            update_progress_bar(data, fraction, progress_text);
-        }
-    }
-    
-    fclose(local_file);
-    sftp_close(remote_file);
-    hide_progress_bar(data);
-    gtk_label_set_text(GTK_LABEL(data->status_label), "File copied!");
-    refresh_remote_directory(data);
-}
-
-// Copy file from remote
-void copy_file_from_remote(AppData *data, const char *remote_path, const char *local_path) {
-    if (data->copy_aborted) {
-        return;
-    }
-    
-    if (data->use_scp) {
-        copy_file_from_remote_scp(data, remote_path, local_path);
-        return;
-    }
-    
-    // SFTP implementation
-    if (!data->connected || !data->sftp) {
-        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
-        return;
-    }
-    
-    // Check if remote file exists
-    sftp_attributes remote_attrs = sftp_stat(data->sftp, remote_path);
-    if (!remote_attrs) {
-        // File no longer exists, update GUI and continue.
-        refresh_remote_directory(data);
-        return;
-    }
-    
-    // Check if local file exists
-    struct stat local_st;
-    int local_exists = (stat(local_path, &local_st) == 0 && S_ISREG(local_st.st_mode));
-    if (local_exists && remote_attrs && !data->overwrite_all && !data->skip_all) {
-        // Conflict: File already exists
-        char local_size_str[64];
-        char local_date_str[64];
-        char remote_size_str[64];
-        char remote_date_str[64];
-        
-        format_file_size(local_size_str, sizeof(local_size_str), local_st.st_size);
-        format_file_date(local_date_str, sizeof(local_date_str), local_st.st_mtime);
-        format_file_size(remote_size_str, sizeof(remote_size_str), remote_attrs->size);
-        format_file_date(remote_date_str, sizeof(remote_date_str), remote_attrs->mtime);
-        
-        const char *filename = strrchr(local_path, '/');
-        filename = filename ? filename + 1 : local_path;
-        
-        ConflictResponse response = show_conflict_dialog(filename, remote_size_str, remote_date_str, local_size_str, local_date_str);
-        
-        if (response == CONFLICT_SKIP || response == CONFLICT_SKIP_ALL) {
-            sftp_attributes_free(remote_attrs);
-            if (response == CONFLICT_SKIP_ALL) {
-                data->skip_all = 1;
-            }
-            return;
-        } else if (response == CONFLICT_OVERWRITE_ALL) {
-            data->overwrite_all = 1;
-        } else if (response == CONFLICT_ABORT) {
-            data->copy_aborted = 1;
-            sftp_attributes_free(remote_attrs);
-            return;
-        }
-    }
-    
-    sftp_file remote_file = sftp_open(data->sftp, remote_path, O_RDONLY, 0);
-    if (!remote_file) {
-        if (remote_attrs) sftp_attributes_free(remote_attrs);
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Error opening: %s", ssh_get_error(data->session));
-        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        return;
-    }
-    
-    // Determine file size
-    sftp_attributes attrs = sftp_fstat(remote_file);
-    uint64_t file_size = attrs ? attrs->size : 0;
-    if (attrs) sftp_attributes_free(attrs);
-    if (remote_attrs) sftp_attributes_free(remote_attrs);
-    
-    FILE *local_file = fopen(local_path, "wb");
-    if (!local_file) {
-        sftp_close(remote_file);
-        gtk_label_set_text(GTK_LABEL(data->status_label), "Could not create local file");
-        return;
-    }
-    
-    // Show progress bar
-    show_progress_bar(data);
-    char progress_text[256];
-    snprintf(progress_text, sizeof(progress_text), "Loading... 0 / %llu Bytes", (unsigned long long)file_size);
-    update_progress_bar(data, 0.0, progress_text);
-    
-    char buffer[8192];
-    ssize_t bytes_read;
-    size_t bytes_written;
-    uint64_t total_read = 0;
-    
-    while ((bytes_read = sftp_read(remote_file, buffer, sizeof(buffer))) > 0) {
-        bytes_written = fwrite(buffer, 1, bytes_read, local_file);
-        if (bytes_written != (size_t)bytes_read) {
-            gtk_label_set_text(GTK_LABEL(data->status_label), "Error writing");
-            hide_progress_bar(data);
-            break;
-        }
-        
-        total_read += bytes_read;
-        // Update progress
-        if (file_size > 0) {
-            double fraction = (double)total_read / (double)file_size;
-            snprintf(progress_text, sizeof(progress_text), "Loading... %llu / %llu Bytes (%.1f%%)", 
-                     (unsigned long long)total_read, (unsigned long long)file_size, fraction * 100.0);
-            update_progress_bar(data, fraction, progress_text);
-        }
-    }
-    
-    sftp_close(remote_file);
-    fclose(local_file);
-    hide_progress_bar(data);
-    gtk_label_set_text(GTK_LABEL(data->status_label), "File copied!");
-    refresh_local_directory(data);
-}
-
-// Recursive copying of a directory to a remote location (SFTP)
+// Recursive copying of a directory to a remote location using SFTP
 void copy_directory_to_remote_sftp(AppData *data, const char *local_path, const char *remote_path) {
     if (data->copy_aborted) {
         return;
@@ -1454,123 +1374,7 @@ void copy_directory_to_remote_sftp(AppData *data, const char *local_path, const 
     }
 }
 
-// Recursive copying of a directory from remote (SFTP)
-void copy_directory_from_remote_sftp(AppData *data, const char *remote_path, const char *local_path) {
-    if (data->copy_aborted) {
-        return;
-    }
-    
-    // Progress bar for directory copy (indefinite progress)
-    static int depth = 0;
-    if (!data || !data->progress_bar) {
-        return;
-    }
-    if (depth == 0) {
-        show_progress_bar(data);
-        gtk_progress_bar_set_pulse_step(GTK_PROGRESS_BAR(data->progress_bar), 0.1);
-        update_progress_bar(data, 0.0, "Loading directory...");
-    }
-    depth++;
-    
-    // Check if local directory exists (only at the first level)
-    struct stat st;
-    int dir_exists = (stat(local_path, &st) == 0 && S_ISDIR(st.st_mode));
-    if (dir_exists && depth == 1 && !data->overwrite_all && !data->skip_all) {
-        // Conflict: Directory already exists
-        const char *dirname = strrchr(local_path, '/');
-        dirname = dirname ? dirname + 1 : local_path;
-        
-        ConflictResponse response = show_directory_conflict_dialog(dirname);
-        
-        if (response == CONFLICT_SKIP || response == CONFLICT_SKIP_ALL) {
-            if (depth == 1) {
-                hide_progress_bar(data);
-            }
-            depth--;
-            if (response == CONFLICT_SKIP_ALL) {
-                data->skip_all = 1;
-            }
-            return;
-        } else if (response == CONFLICT_OVERWRITE_ALL) {
-            data->overwrite_all = 1;
-        } else if (response == CONFLICT_ABORT) {
-            data->copy_aborted = 1;
-            if (depth == 1) {
-                hide_progress_bar(data);
-            }
-            depth--;
-            return;
-        }
-    }
-    
-    // Create local directory
-    if (mkdir(local_path, 0755) != 0 && errno != EEXIST) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Error creating directory: %s", local_path);
-        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        if (depth == 1) {
-            hide_progress_bar(data);
-        }
-        depth--;
-        return;
-    }
-    
-    // Open remote directory
-    sftp_dir dir = sftp_opendir(data->sftp, remote_path);
-    if (!dir) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Error opening: %s", ssh_get_error(data->session));
-        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        if (depth == 1) {
-            hide_progress_bar(data);
-        }
-        depth--;
-        return;
-    }
-    
-    sftp_attributes attributes;
-    while ((attributes = sftp_readdir(data->sftp, dir)) != NULL) {
-        if (attributes->name[0] == '.') {
-            sftp_attributes_free(attributes);
-            continue;
-        }
-        
-        char remote_full[2048];
-        char local_full[2048];
-        snprintf(remote_full, sizeof(remote_full), "%s/%s", remote_path, attributes->name);
-        snprintf(local_full, sizeof(local_full), "%s/%s", local_path, attributes->name);
-        
-        if (attributes->type == SSH_FILEXFER_TYPE_DIRECTORY) {
-            // Copy directory recursively
-            copy_directory_from_remote_sftp(data, remote_full, local_full);
-        } else {
-            // Copy file
-            copy_file_from_remote(data, remote_full, local_full);
-        }
-        
-        sftp_attributes_free(attributes);
-        
-        // Pulses for indefinite progress
-        if (depth == 1 && data && data->progress_bar) {
-            gtk_progress_bar_pulse(GTK_PROGRESS_BAR(data->progress_bar));
-            while (gtk_events_pending()) {
-                gtk_main_iteration();
-            }
-        }
-    }
-    
-    sftp_closedir(dir);
-    depth--;
-    if (depth == 0 && data && data->progress_bar) {
-        hide_progress_bar(data);
-        if (data->status_label) {
-            gtk_label_set_text(GTK_LABEL(data->status_label), "Directory copied!");
-        }
-        refresh_local_directory(data);
-    }
-}
-
-// Recursive copying of a directory to a remote location (SCP)
+// Recursive copying of a directory to a remote location using SCP
 // Use recursive file copying over normal SCP functions
 void copy_directory_to_remote_scp(AppData *data, const char *local_path, const char *remote_path) {
     if (data->copy_aborted) {
@@ -1725,6 +1529,131 @@ void copy_directory_to_remote_scp(AppData *data, const char *local_path, const c
             gtk_label_set_text(GTK_LABEL(data->status_label), "Directory copied!");
         }
         refresh_remote_directory(data);
+    }
+}
+
+// Recursive copying of a directory from remote
+void copy_directory_from_remote(AppData *data, const char *remote_path, const char *local_path) {
+    if (data->protocol == 0) {
+        copy_directory_from_remote_sftp(data, remote_path, local_path);
+    } else if (data->protocol == 1) {
+        copy_directory_from_remote_scp(data, remote_path, local_path);
+    }
+}
+
+// Recursive copying of a directory from remote (SFTP)
+void copy_directory_from_remote_sftp(AppData *data, const char *remote_path, const char *local_path) {
+    if (data->copy_aborted) {
+        return;
+    }
+    
+    // Progress bar for directory copy (indefinite progress)
+    static int depth = 0;
+    if (!data || !data->progress_bar) {
+        return;
+    }
+    if (depth == 0) {
+        show_progress_bar(data);
+        gtk_progress_bar_set_pulse_step(GTK_PROGRESS_BAR(data->progress_bar), 0.1);
+        update_progress_bar(data, 0.0, "Loading directory...");
+    }
+    depth++;
+    
+    // Check if local directory exists (only at the first level)
+    struct stat st;
+    int dir_exists = (stat(local_path, &st) == 0 && S_ISDIR(st.st_mode));
+    if (dir_exists && depth == 1 && !data->overwrite_all && !data->skip_all) {
+        // Conflict: Directory already exists
+        const char *dirname = strrchr(local_path, '/');
+        dirname = dirname ? dirname + 1 : local_path;
+        
+        ConflictResponse response = show_directory_conflict_dialog(dirname);
+        
+        if (response == CONFLICT_SKIP || response == CONFLICT_SKIP_ALL) {
+            if (depth == 1) {
+                hide_progress_bar(data);
+            }
+            depth--;
+            if (response == CONFLICT_SKIP_ALL) {
+                data->skip_all = 1;
+            }
+            return;
+        } else if (response == CONFLICT_OVERWRITE_ALL) {
+            data->overwrite_all = 1;
+        } else if (response == CONFLICT_ABORT) {
+            data->copy_aborted = 1;
+            if (depth == 1) {
+                hide_progress_bar(data);
+            }
+            depth--;
+            return;
+        }
+    }
+    
+    // Create local directory
+    if (mkdir(local_path, 0755) != 0 && errno != EEXIST) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Error creating directory: %s", local_path);
+        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        if (depth == 1) {
+            hide_progress_bar(data);
+        }
+        depth--;
+        return;
+    }
+    
+    // Open remote directory
+    sftp_dir dir = sftp_opendir(data->sftp, remote_path);
+    if (!dir) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Error opening: %s", ssh_get_error(data->session));
+        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+        if (depth == 1) {
+            hide_progress_bar(data);
+        }
+        depth--;
+        return;
+    }
+    
+    sftp_attributes attributes;
+    while ((attributes = sftp_readdir(data->sftp, dir)) != NULL) {
+        if (attributes->name[0] == '.') {
+            sftp_attributes_free(attributes);
+            continue;
+        }
+        
+        char remote_full[2048];
+        char local_full[2048];
+        snprintf(remote_full, sizeof(remote_full), "%s/%s", remote_path, attributes->name);
+        snprintf(local_full, sizeof(local_full), "%s/%s", local_path, attributes->name);
+        
+        if (attributes->type == SSH_FILEXFER_TYPE_DIRECTORY) {
+            // Copy directory recursively
+            copy_directory_from_remote_sftp(data, remote_full, local_full);
+        } else {
+            // Copy file
+            copy_file_from_remote(data, remote_full, local_full);
+        }
+        
+        sftp_attributes_free(attributes);
+        
+        // Pulses for indefinite progress
+        if (depth == 1 && data && data->progress_bar) {
+            gtk_progress_bar_pulse(GTK_PROGRESS_BAR(data->progress_bar));
+            while (gtk_events_pending()) {
+                gtk_main_iteration();
+            }
+        }
+    }
+    
+    sftp_closedir(dir);
+    depth--;
+    if (depth == 0 && data && data->progress_bar) {
+        hide_progress_bar(data);
+        if (data->status_label) {
+            gtk_label_set_text(GTK_LABEL(data->status_label), "Directory copied!");
+        }
+        refresh_local_directory(data);
     }
 }
 
@@ -1900,22 +1829,394 @@ void copy_directory_from_remote_scp(AppData *data, const char *remote_path, cons
     }
 }
 
-// Recursive copying of a directory to a remote location
-void copy_directory_to_remote(AppData *data, const char *local_path, const char *remote_path) {
-    if (data->use_scp) {
-        copy_directory_to_remote_scp(data, local_path, remote_path);
+// Delete local file or directory
+void delete_local_file(AppData *data, const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        // File no longer exists, update GUI and continue.
+        refresh_local_directory(data);
+        return;
+    }
+    
+    if (S_ISDIR(st.st_mode)) {
+        delete_local_directory_recursive(path);
     } else {
-        copy_directory_to_remote_sftp(data, local_path, remote_path);
+        if (remove(path) != 0) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "Error deleting file: %s", strerror(errno));
+            gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+            return;
+        }
+    }
+    
+    refresh_local_directory(data);
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Deleted: %s", path);
+    gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+}
+
+// Recursively delete local directory
+void delete_local_directory_recursive(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) {
+        return;
+    }
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        
+        char full_path[2048];
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+        
+        struct stat st;
+        if (stat(full_path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                delete_local_directory_recursive(full_path);
+                rmdir(full_path);
+            } else {
+                remove(full_path);
+            }
+        }
+    }
+    closedir(dir);
+    rmdir(path);
+}
+
+// Delete remote file or directory
+void delete_remote_file(AppData *data, const char *path) {
+    if (data->protocol == 0) {
+        delete_remote_file_sftp(data, path);
+    } else if (data->protocol == 1) {
+        delete_remote_file_scp(data, path);
     }
 }
 
-// Recursive copying of a directory from remote
-void copy_directory_from_remote(AppData *data, const char *remote_path, const char *local_path) {
-    if (data->use_scp) {
-        copy_directory_from_remote_scp(data, remote_path, local_path);
-    } else {
-        copy_directory_from_remote_sftp(data, remote_path, local_path);
+// Delete remote file or directory using SFTP
+void delete_remote_file_sftp(AppData *data, const char *path) {
+    if (!data->connected || !data->session) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
+        return;
     }
+    
+    // SFTP mode
+    sftp_attributes attributes = sftp_stat(data->sftp, path);
+    if (!attributes) {
+        // File no longer exists, update GUI and continue.
+        refresh_remote_directory(data);
+        return;
+    }
+    
+    if (attributes->type == SSH_FILEXFER_TYPE_DIRECTORY) {
+        delete_remote_directory_sftp(data, path);
+    } else {
+        if (sftp_unlink(data->sftp, path) != SSH_OK) {
+            gtk_label_set_text(GTK_LABEL(data->status_label), "Error deleting remote file");
+            sftp_attributes_free(attributes);
+            return;
+        }
+    }
+    
+    sftp_attributes_free(attributes);
+    
+    refresh_remote_directory(data);
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Deleted: %s", path);
+    gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+}
+
+// Delete remote file or directory using SCP
+void delete_remote_file_scp(AppData *data, const char *path) {
+    if (!data->connected || !data->session) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
+        return;
+    }
+    
+    // SCP mode: Use SSH commands
+    ssh_channel channel = ssh_channel_new(data->session);
+    if (!channel) {
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Error creating channel");
+        return;
+    }
+    
+    if (ssh_channel_open_session(channel) != SSH_OK) {
+        ssh_channel_free(channel);
+        gtk_label_set_text(GTK_LABEL(data->status_label), "Error opening channel");
+        return;
+    }
+    
+    // Check if the file/directory exists
+    char test_command[2048];
+    snprintf(test_command, sizeof(test_command), "test -e '%s' && echo 'exists' || echo ''", path);
+    
+    if (ssh_channel_request_exec(channel, test_command) == SSH_OK) {
+        char buffer[64];
+        int nbytes = ssh_channel_read(channel, buffer, sizeof(buffer) - 1, 0);
+        if (nbytes > 0) {
+            buffer[nbytes] = '\0';
+            char *newline = strchr(buffer, '\n');
+            if (newline) *newline = '\0';
+            
+            if (strcmp(buffer, "exists") != 0) {
+                // File/directory no longer exists, refresh GUI and continue.
+                ssh_channel_send_eof(channel);
+                ssh_channel_close(channel);
+                ssh_channel_free(channel);
+                refresh_remote_directory(data);
+                return;
+            }
+        }
+        ssh_channel_send_eof(channel);
+        ssh_channel_close(channel);
+        ssh_channel_free(channel);
+        
+        // Check if it's a directory.
+        channel = ssh_channel_new(data->session);
+        if (channel && ssh_channel_open_session(channel) == SSH_OK) {
+            snprintf(test_command, sizeof(test_command), "test -d '%s'", path);
+            
+            if (ssh_channel_request_exec(channel, test_command) == SSH_OK) {
+                ssh_channel_send_eof(channel);
+                ssh_channel_close(channel);
+                ssh_channel_free(channel);
+                
+                // It is a directory
+                delete_remote_directory_scp(data, path);
+            } else {
+                ssh_channel_send_eof(channel);
+                ssh_channel_close(channel);
+                ssh_channel_free(channel);
+                
+                // It is a file
+                channel = ssh_channel_new(data->session);
+                if (channel && ssh_channel_open_session(channel) == SSH_OK) {
+                    char command[2048];
+                    snprintf(command, sizeof(command), "rm -f '%s'", path);
+                    ssh_channel_request_exec(channel, command);
+                    ssh_channel_send_eof(channel);
+                    ssh_channel_close(channel);
+                }
+                if (channel) {
+                    ssh_channel_free(channel);
+                }
+            }
+        } else if (channel) {
+            ssh_channel_free(channel);
+        }
+    } else {
+        ssh_channel_send_eof(channel);
+        ssh_channel_close(channel);
+        ssh_channel_free(channel);
+    }
+    
+    refresh_remote_directory(data);
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Deleted: %s", path);
+    gtk_label_set_text(GTK_LABEL(data->status_label), msg);
+}
+
+// Recursively delete remote directory using SFTP
+void delete_remote_directory_sftp(AppData *data, const char *path) {
+    sftp_dir dir = sftp_opendir(data->sftp, path);
+    if (!dir) {
+        return;
+    }
+    
+    sftp_attributes attributes;
+    while ((attributes = sftp_readdir(data->sftp, dir)) != NULL) {
+        if (strcmp(attributes->name, ".") == 0 || strcmp(attributes->name, "..") == 0) {
+            sftp_attributes_free(attributes);
+            continue;
+        }
+        
+        char full_path[2048];
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, attributes->name);
+        
+        if (attributes->type == SSH_FILEXFER_TYPE_DIRECTORY) {
+            delete_remote_directory_sftp(data, full_path);
+            sftp_rmdir(data->sftp, full_path);
+        } else {
+            sftp_unlink(data->sftp, full_path);
+        }
+        
+        sftp_attributes_free(attributes);
+    }
+    sftp_closedir(dir);
+    sftp_rmdir(data->sftp, path);
+}
+
+// Recursively delete remote directory using SCP
+void delete_remote_directory_scp(AppData *data, const char *path) {
+    ssh_channel channel = ssh_channel_new(data->session);
+    if (!channel) {
+        return;
+    }
+    
+    if (ssh_channel_open_session(channel) != SSH_OK) {
+        ssh_channel_free(channel);
+        return;
+    }
+    
+    // Execute rm -rf
+    char command[2048];
+    snprintf(command, sizeof(command), "rm -rf '%s'", path);
+    
+    if (ssh_channel_request_exec(channel, command) != SSH_OK) {
+        ssh_channel_close(channel);
+        ssh_channel_free(channel);
+        return;
+    }
+    
+    ssh_channel_send_eof(channel);
+    ssh_channel_close(channel);
+    ssh_channel_free(channel);
+}
+
+// Helper functions for the progress bar
+void show_progress_bar(AppData *data) {
+    gtk_widget_set_visible(data->progress_bar, TRUE);
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(data->progress_bar), 0.0);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(data->progress_bar), "");
+}
+
+void hide_progress_bar(AppData *data) {
+    gtk_widget_set_visible(data->progress_bar, FALSE);
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(data->progress_bar), 0.0);
+}
+
+void update_progress_bar(AppData *data, double fraction, const char *text) {
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(data->progress_bar), fraction);
+    if (text) {
+        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(data->progress_bar), text);
+    }
+    // Update GUI
+    while (gtk_events_pending()) {
+        gtk_main_iteration();
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Update callback for local file directory
+void on_local_refresh_clicked(GtkWidget *widget, gpointer data) {
+    AppData *app = (AppData *)data;
+    refresh_local_directory(app);
+}
+
+// Update callback for remote file directory
+void on_remote_refresh_clicked(GtkWidget *widget, gpointer data) {
+    AppData *app = (AppData *)data;
+    if (app->connected) {
+        refresh_remote_directory(app);
+    } else {
+        gtk_label_set_text(GTK_LABEL(app->status_label), "Not connected!");
+    }
+}
+
+// Callback for connection button
+void on_connect_clicked(GtkWidget *widget, gpointer data) {
+    AppData *app = (AppData *)data;
+    if (app->connected) {
+        disconnect_ssh(app);
+    } else {
+        connect_ssh(app);
+    }
+}
+
+// Show conflict dialogue
+ConflictResponse show_conflict_dialog(const char *filename, const char *local_size, const char *local_date, const char *remote_size, const char *remote_date) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("File Conflict",
+                                                     NULL,
+                                                     GTK_DIALOG_MODAL,
+                                                     "Overwrite", CONFLICT_OVERWRITE,
+                                                     "Overwrite All", CONFLICT_OVERWRITE_ALL,
+                                                     "Skip", CONFLICT_SKIP,
+                                                     "Skip All", CONFLICT_SKIP_ALL,
+                                                     "Abort", CONFLICT_ABORT,
+                                                     NULL);
+    
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 10);
+    
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    
+    char msg[512];
+    snprintf(msg, sizeof(msg), "File already exists:\n%s", filename);
+    GtkWidget *label = gtk_label_new(msg);
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
+    
+    // Local file info
+    char local_info[256];
+    snprintf(local_info, sizeof(local_info), "Local:  %s  %s", local_size, local_date);
+    label = gtk_label_new(local_info);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
+    
+    // Remote File Info
+    char remote_info[256];
+    snprintf(remote_info, sizeof(remote_info), "Remote: %s  %s", remote_size, remote_date);
+    label = gtk_label_new(remote_info);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
+    
+    gtk_container_add(GTK_CONTAINER(content), vbox);
+    gtk_widget_show_all(dialog);
+    
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    
+    return (ConflictResponse)response;
+}
+
+// Show directory conflict dialog
+ConflictResponse show_directory_conflict_dialog(const char *dirname) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Directory Conflict",
+                                                     NULL,
+                                                     GTK_DIALOG_MODAL,
+                                                     "Overwrite", CONFLICT_OVERWRITE,
+                                                     "Overwrite All", CONFLICT_OVERWRITE_ALL,
+                                                     "Skip", CONFLICT_SKIP,
+                                                     "Skip All", CONFLICT_SKIP_ALL,
+                                                     "Abort", CONFLICT_ABORT,
+                                                     NULL);
+    
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 10);
+    
+    char msg[512];
+    snprintf(msg, sizeof(msg), "Directory already exists:\n%s", dirname);
+    GtkWidget *label = gtk_label_new(msg);
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_container_add(GTK_CONTAINER(content), label);
+    
+    gtk_widget_show_all(dialog);
+    
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    
+    return (ConflictResponse)response;
+}
+
+// Format File size
+void format_file_size(char *buffer, size_t size, uint64_t bytes) {
+    if (bytes < 1024) {
+        snprintf(buffer, size, "%llu B", (unsigned long long)bytes);
+    } else if (bytes < 1024 * 1024) {
+        snprintf(buffer, size, "%.1f KB", bytes / 1024.0);
+    } else if (bytes < 1024ULL * 1024 * 1024) {
+        snprintf(buffer, size, "%.1f MB", bytes / (1024.0 * 1024.0));
+    } else {
+        snprintf(buffer, size, "%.1f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+}
+
+// Date Format
+void format_file_date(char *buffer, size_t size, time_t mtime) {
+    struct tm *tm_info = localtime(&mtime);
+    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", tm_info);
 }
 
 // Callback for double-clicking local file
@@ -1990,9 +2291,9 @@ void on_remote_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
                 if (strcmp(path_copy, "/") == 0) {
                     // Already in the root
                     return;
-                } else if (strcmp(path_copy, ".") == 0 || strcmp(path_copy, "") == 0) {
+                //} else if (strcmp(path_copy, ".") == 0 || strcmp(path_copy, "") == 0) {
                     // Already in the current directory or empty
-                    return;
+                //    return;
                 } else {
                     // Remove the last directory
                 char *last_slash = strrchr(path_copy, '/');
@@ -2175,8 +2476,8 @@ void on_copy_to_local_clicked(GtkWidget *widget, gpointer data) {
         GtkTreeIter tree_iter;
         
         if (gtk_tree_model_get_iter(model, &tree_iter, path)) {
-    gchar *filename;
-    gchar *type;
+            gchar *filename;
+            gchar *type;
             gtk_tree_model_get(model, &tree_iter, 0, &filename, 1, &type, -1);
             
             char local_full_path[2048];
@@ -2190,239 +2491,14 @@ void on_copy_to_local_clicked(GtkWidget *widget, gpointer data) {
                 copy_file_from_remote(app, remote_full_path, local_full_path);
             }
             
-        g_free(filename);
-        g_free(type);
+            g_free(filename);
+            g_free(type);
         }
         
         iter = iter->next;
     }
     
     g_list_free_full(selected_rows, (GDestroyNotify)gtk_tree_path_free);
-}
-
-// Recursively delete local directory
-void delete_local_directory_recursive(const char *path) {
-    DIR *dir = opendir(path);
-    if (!dir) {
-        return;
-    }
-    
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        
-        char full_path[2048];
-        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-        
-        struct stat st;
-        if (stat(full_path, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
-                delete_local_directory_recursive(full_path);
-                rmdir(full_path);
-            } else {
-                remove(full_path);
-            }
-        }
-    }
-    closedir(dir);
-    rmdir(path);
-}
-
-// Delete local file or directory
-void delete_local_file(AppData *data, const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        // File no longer exists, update GUI and continue.
-        refresh_local_directory(data);
-        return;
-    }
-    
-    if (S_ISDIR(st.st_mode)) {
-        delete_local_directory_recursive(path);
-    } else {
-        if (remove(path) != 0) {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "Error deleting file: %s", strerror(errno));
-            gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-            return;
-        }
-    }
-    
-    refresh_local_directory(data);
-    char msg[256];
-    snprintf(msg, sizeof(msg), "Deleted: %s", path);
-    gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-}
-
-// Recursively delete remote directory (SFTP)
-void delete_remote_directory_sftp(AppData *data, const char *path) {
-    sftp_dir dir = sftp_opendir(data->sftp, path);
-    if (!dir) {
-        return;
-    }
-    
-    sftp_attributes attributes;
-    while ((attributes = sftp_readdir(data->sftp, dir)) != NULL) {
-        if (strcmp(attributes->name, ".") == 0 || strcmp(attributes->name, "..") == 0) {
-            sftp_attributes_free(attributes);
-            continue;
-        }
-        
-        char full_path[2048];
-        snprintf(full_path, sizeof(full_path), "%s/%s", path, attributes->name);
-        
-        if (attributes->type == SSH_FILEXFER_TYPE_DIRECTORY) {
-            delete_remote_directory_sftp(data, full_path);
-            sftp_rmdir(data->sftp, full_path);
-        } else {
-            sftp_unlink(data->sftp, full_path);
-        }
-        
-        sftp_attributes_free(attributes);
-    }
-    sftp_closedir(dir);
-    sftp_rmdir(data->sftp, path);
-}
-
-// Recursively delete remote directory (SCP)
-void delete_remote_directory_scp(AppData *data, const char *path) {
-    ssh_channel channel = ssh_channel_new(data->session);
-    if (!channel) {
-        return;
-    }
-    
-    if (ssh_channel_open_session(channel) != SSH_OK) {
-        ssh_channel_free(channel);
-        return;
-    }
-    
-    // Execute rm -rf
-    char command[2048];
-    snprintf(command, sizeof(command), "rm -rf '%s'", path);
-    
-    if (ssh_channel_request_exec(channel, command) != SSH_OK) {
-        ssh_channel_close(channel);
-        ssh_channel_free(channel);
-        return;
-    }
-    
-    ssh_channel_send_eof(channel);
-    ssh_channel_close(channel);
-    ssh_channel_free(channel);
-}
-
-// Delete remote file or directory
-void delete_remote_file(AppData *data, const char *path) {
-    if (!data->connected || !data->session) {
-        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
-        return;
-    }
-    
-    if (data->use_scp) {
-        // SCP mode: Use SSH commands
-        ssh_channel channel = ssh_channel_new(data->session);
-        if (!channel) {
-            gtk_label_set_text(GTK_LABEL(data->status_label), "Error creating channel");
-            return;
-        }
-        
-        if (ssh_channel_open_session(channel) != SSH_OK) {
-            ssh_channel_free(channel);
-            gtk_label_set_text(GTK_LABEL(data->status_label), "Error opening channel");
-            return;
-        }
-        
-        // Check if the file/directory exists
-        char test_command[2048];
-        snprintf(test_command, sizeof(test_command), "test -e '%s' && echo 'exists' || echo ''", path);
-        
-        if (ssh_channel_request_exec(channel, test_command) == SSH_OK) {
-            char buffer[64];
-            int nbytes = ssh_channel_read(channel, buffer, sizeof(buffer) - 1, 0);
-            if (nbytes > 0) {
-                buffer[nbytes] = '\0';
-                char *newline = strchr(buffer, '\n');
-                if (newline) *newline = '\0';
-                
-                if (strcmp(buffer, "exists") != 0) {
-                    // File/directory no longer exists, refresh GUI and continue.
-                    ssh_channel_send_eof(channel);
-                    ssh_channel_close(channel);
-                    ssh_channel_free(channel);
-                    refresh_remote_directory(data);
-                    return;
-                }
-            }
-            ssh_channel_send_eof(channel);
-            ssh_channel_close(channel);
-            ssh_channel_free(channel);
-            
-            // Check if it's a directory.
-            channel = ssh_channel_new(data->session);
-            if (channel && ssh_channel_open_session(channel) == SSH_OK) {
-                snprintf(test_command, sizeof(test_command), "test -d '%s'", path);
-                
-                if (ssh_channel_request_exec(channel, test_command) == SSH_OK) {
-                    ssh_channel_send_eof(channel);
-                    ssh_channel_close(channel);
-                    ssh_channel_free(channel);
-                    
-                    // It is a directory
-                    delete_remote_directory_scp(data, path);
-                } else {
-                    ssh_channel_send_eof(channel);
-                    ssh_channel_close(channel);
-                    ssh_channel_free(channel);
-                    
-                    // It is a file
-                    channel = ssh_channel_new(data->session);
-                    if (channel && ssh_channel_open_session(channel) == SSH_OK) {
-                        char command[2048];
-                        snprintf(command, sizeof(command), "rm -f '%s'", path);
-                        ssh_channel_request_exec(channel, command);
-                        ssh_channel_send_eof(channel);
-                        ssh_channel_close(channel);
-                    }
-                    if (channel) {
-                        ssh_channel_free(channel);
-                    }
-                }
-            } else if (channel) {
-                ssh_channel_free(channel);
-            }
-        } else {
-            ssh_channel_send_eof(channel);
-            ssh_channel_close(channel);
-            ssh_channel_free(channel);
-        }
-    } else {
-        // SFTP mode
-        sftp_attributes attributes = sftp_stat(data->sftp, path);
-        if (!attributes) {
-            // File no longer exists, update GUI and continue.
-            refresh_remote_directory(data);
-            return;
-        }
-        
-        if (attributes->type == SSH_FILEXFER_TYPE_DIRECTORY) {
-            delete_remote_directory_sftp(data, path);
-        } else {
-            if (sftp_unlink(data->sftp, path) != SSH_OK) {
-                gtk_label_set_text(GTK_LABEL(data->status_label), "Error deleting remote file");
-                sftp_attributes_free(attributes);
-                return;
-            }
-        }
-        
-        sftp_attributes_free(attributes);
-    }
-    
-    refresh_remote_directory(data);
-    char msg[256];
-    snprintf(msg, sizeof(msg), "Deleted: %s", path);
-    gtk_label_set_text(GTK_LABEL(data->status_label), msg);
 }
 
 // Callback for Delete button (local)
@@ -2561,8 +2637,8 @@ void on_remote_drag_data_received(GtkWidget *widget, GdkDragContext *context, gi
     for (int i = 0; lines[i] != NULL && !app->copy_aborted; i++) {
         if (strlen(lines[i]) == 0) continue;
     
-    char local_full_path[2048];
-    char remote_full_path[2048];
+        char local_full_path[2048];
+        char remote_full_path[2048];
         snprintf(local_full_path, sizeof(local_full_path), "%s/%s", local_path_text, lines[i]);
         snprintf(remote_full_path, sizeof(remote_full_path), "%s/%s", remote_path_text, lines[i]);
         
@@ -2677,7 +2753,7 @@ void on_local_drag_data_received(GtkWidget *widget, GdkDragContext *context, gin
         snprintf(remote_full_path, sizeof(remote_full_path), "%s/%s", remote_path_text, lines[i]);
         
         // Check if it's a directory (remotely)
-        if (app->use_scp) {
+        if (app->protocol) {
             // For SCP: Check via SSH command
             ssh_channel channel = ssh_channel_new(app->session);
             if (channel && ssh_channel_open_session(channel) == SSH_OK) {
@@ -2781,7 +2857,7 @@ void on_delete_local_clicked(GtkWidget *widget, gpointer data) {
             gtk_tree_model_get(model, &iter, 0, &filename, -1);
             const char *local_path_text = gtk_entry_get_text(GTK_ENTRY(app->local_path_entry));
             char local_full_path[2048];
-    snprintf(local_full_path, sizeof(local_full_path), "%s/%s", local_path_text, filename);
+            snprintf(local_full_path, sizeof(local_full_path), "%s/%s", local_path_text, filename);
             
             confirm_dialog = gtk_message_dialog_new(NULL,
                                                     GTK_DIALOG_MODAL,
@@ -2930,7 +3006,7 @@ void on_delete_remote_clicked(GtkWidget *widget, gpointer data) {
             gtk_tree_model_get(model, &iter, 0, &filename, -1);
             const char *remote_path_text = gtk_entry_get_text(GTK_ENTRY(app->remote_path_entry));
             char remote_full_path[2048];
-    snprintf(remote_full_path, sizeof(remote_full_path), "%s/%s", remote_path_text, filename);
+            snprintf(remote_full_path, sizeof(remote_full_path), "%s/%s", remote_path_text, filename);
     
             confirm_dialog = gtk_message_dialog_new(NULL,
                                                     GTK_DIALOG_MODAL,
@@ -2979,8 +3055,8 @@ void on_delete_remote_clicked(GtkWidget *widget, gpointer data) {
                 snprintf(item_info, 2048, "%s|%s", remote_full_path, type);
                 paths_to_delete = g_list_append(paths_to_delete, item_info);
     
-    g_free(filename);
-    g_free(type);
+                g_free(filename);
+                g_free(type);
                 g_free(remote_full_path);
             }
             
@@ -3000,7 +3076,7 @@ void on_delete_remote_clicked(GtkWidget *widget, gpointer data) {
                 char *type = pipe_pos + 1;
                 
                 // Delete directly, without calling refresh_remote_directory
-                if (app->use_scp) {
+                if (app->protocol) {
                     // SCP mode: Use SSH commands
                     ssh_channel channel = ssh_channel_new(app->session);
                     if (channel && ssh_channel_open_session(channel) == SSH_OK) {
@@ -3045,79 +3121,6 @@ void on_delete_remote_clicked(GtkWidget *widget, gpointer data) {
     }
     
     g_list_free_full(selected_rows, (GDestroyNotify)gtk_tree_path_free);
-}
-
-// Create local directory
-void create_local_directory(AppData *data, const char *dirname) {
-    const char *local_path_text = gtk_entry_get_text(GTK_ENTRY(data->local_path_entry));
-    char full_path[2048];
-    snprintf(full_path, sizeof(full_path), "%s/%s", local_path_text, dirname);
-    
-    if (mkdir(full_path, 0755) != 0) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Error creating directory: %s", strerror(errno));
-        gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-        return;
-    }
-    
-    refresh_local_directory(data);
-    char msg[256];
-    snprintf(msg, sizeof(msg), "Created directory: %s", full_path);
-    gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-}
-
-// Create remote directory
-void create_remote_directory(AppData *data, const char *dirname) {
-    if (!data->connected || !data->session) {
-        gtk_label_set_text(GTK_LABEL(data->status_label), "Not connected!");
-        return;
-    }
-    
-    const char *remote_path_text = gtk_entry_get_text(GTK_ENTRY(data->remote_path_entry));
-    char full_path[2048];
-    snprintf(full_path, sizeof(full_path), "%s/%s", remote_path_text, dirname);
-    
-    if (data->use_scp) {
-        // SCP mode: Use SSH command
-        ssh_channel channel = ssh_channel_new(data->session);
-        if (!channel) {
-            gtk_label_set_text(GTK_LABEL(data->status_label), "Error creating channel");
-            return;
-        }
-        
-        if (ssh_channel_open_session(channel) != SSH_OK) {
-            ssh_channel_free(channel);
-            gtk_label_set_text(GTK_LABEL(data->status_label), "Error opening channel");
-            return;
-        }
-        
-        char command[2048];
-        snprintf(command, sizeof(command), "mkdir -p '%s'", full_path);
-        
-        if (ssh_channel_request_exec(channel, command) != SSH_OK) {
-            ssh_channel_close(channel);
-            ssh_channel_free(channel);
-            gtk_label_set_text(GTK_LABEL(data->status_label), "Error creating remote directory");
-            return;
-        }
-        
-        ssh_channel_send_eof(channel);
-        ssh_channel_close(channel);
-        ssh_channel_free(channel);
-    } else {
-        // SFTP mode
-        if (sftp_mkdir(data->sftp, full_path, 0755) != SSH_OK) {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "Error creating remote directory: %s", ssh_get_error(data->session));
-            gtk_label_set_text(GTK_LABEL(data->status_label), msg);
-            return;
-        }
-    }
-    
-    refresh_remote_directory(data);
-    char msg[256];
-    snprintf(msg, sizeof(msg), "Created directory: %s", full_path);
-    gtk_label_set_text(GTK_LABEL(data->status_label), msg);
 }
 
 // Callback for mkdir button (local)
@@ -3197,9 +3200,9 @@ void on_mkdir_remote_clicked(GtkWidget *widget, gpointer data) {
     gtk_widget_destroy(dialog);
 }
 
-// Request key file password
-char* prompt_key_file_password(void) {
-    GtkWidget *dialog = gtk_dialog_new_with_buttons("Key File Password",
+// Request a password
+char* prompt_password(char* title_text, char* label_text, gboolean show_text) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(title_text,
                                                      NULL,
                                                      GTK_DIALOG_MODAL,
                                                      "Cancel", GTK_RESPONSE_CANCEL,
@@ -3210,49 +3213,11 @@ char* prompt_key_file_password(void) {
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
     
-    GtkWidget *label = gtk_label_new("The key file is password protected.\nPlease enter the password:");
+    GtkWidget *label = gtk_label_new(label_text);
     gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
     
     GtkWidget *entry = gtk_entry_new();
-    gtk_entry_set_visibility(GTK_ENTRY(entry), FALSE); // Hide password
-    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
-    gtk_box_pack_start(GTK_BOX(vbox), entry, FALSE, FALSE, 0);
-    
-    gtk_container_add(GTK_CONTAINER(content), vbox);
-    gtk_widget_show_all(dialog);
-    
-    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
-    
-    char *password = NULL;
-    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
-        const char *text = gtk_entry_get_text(GTK_ENTRY(entry));
-        if (text && strlen(text) > 0) {
-            password = g_strdup(text);
-        }
-    }
-    
-    gtk_widget_destroy(dialog);
-    return password;
-}
-
-// Request SSH password
-char* prompt_ssh_password(void) {
-    GtkWidget *dialog = gtk_dialog_new_with_buttons("SSH Password",
-                                                     NULL,
-                                                     GTK_DIALOG_MODAL,
-                                                     "Cancel", GTK_RESPONSE_CANCEL,
-                                                     "OK", GTK_RESPONSE_ACCEPT,
-                                                     NULL);
-    
-    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
-    
-    GtkWidget *label = gtk_label_new("Please enter the SSH password:");
-    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
-    
-    GtkWidget *entry = gtk_entry_new();
-    gtk_entry_set_visibility(GTK_ENTRY(entry), FALSE); // Hide password
+    gtk_entry_set_visibility(GTK_ENTRY(entry), show_text); // Hide password
     gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
     gtk_box_pack_start(GTK_BOX(vbox), entry, FALSE, FALSE, 0);
     
@@ -3449,33 +3414,6 @@ gboolean verify_ssh_fingerprint(ssh_session session, const char *host, int port)
     }
 }
 
-// Retrieve saved connection names
-GList* get_saved_connection_names(void) {
-    char *config_file = get_config_file_path();
-    GKeyFile *key_file = g_key_file_new();
-    GError *error = NULL;
-    GList *names = NULL;
-    
-    if (g_key_file_load_from_file(key_file, config_file, G_KEY_FILE_NONE, &error)) {
-        gsize length;
-        gchar **groups = g_key_file_get_groups(key_file, &length);
-        
-        for (gsize i = 0; i < length; i++) {
-            names = g_list_append(names, g_strdup(groups[i]));
-        }
-        
-        g_strfreev(groups);
-    }
-    
-    if (error) {
-        g_error_free(error);
-    }
-    
-    g_key_file_free(key_file);
-    g_free(config_file);
-    return names;
-}
-
 // Save connection
 void save_connection(AppData *data) {
     // Dialog for entering the name
@@ -3587,6 +3525,33 @@ void load_connection(AppData *data, const char *name) {
     
     g_key_file_free(key_file);
     g_free(config_file);
+}
+
+// Retrieve saved connection names
+GList* get_saved_connection_names(void) {
+    char *config_file = get_config_file_path();
+    GKeyFile *key_file = g_key_file_new();
+    GError *error = NULL;
+    GList *names = NULL;
+    
+    if (g_key_file_load_from_file(key_file, config_file, G_KEY_FILE_NONE, &error)) {
+        gsize length;
+        gchar **groups = g_key_file_get_groups(key_file, &length);
+        
+        for (gsize i = 0; i < length; i++) {
+            names = g_list_append(names, g_strdup(groups[i]));
+        }
+        
+        g_strfreev(groups);
+    }
+    
+    if (error) {
+        g_error_free(error);
+    }
+    
+    g_key_file_free(key_file);
+    g_free(config_file);
+    return names;
 }
 
 // Delete connection
@@ -4017,7 +3982,7 @@ GtkWidget* create_gui(AppData *data) {
     
     GtkWidget *remote_path_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     data->remote_path_entry = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(data->remote_path_entry), ".");
+    gtk_entry_set_text(GTK_ENTRY(data->remote_path_entry), "");
     gtk_box_pack_start(GTK_BOX(remote_path_box), data->remote_path_entry, TRUE, TRUE, 0);
     
     GtkWidget *remote_refresh = gtk_button_new_with_label("Refresh");
@@ -4111,7 +4076,7 @@ int main(int argc, char *argv[]) {
     app_data->connected = 0;
     app_data->session = NULL;
     app_data->sftp = NULL;
-    app_data->use_scp = 0;  // Default is SFTP
+    app_data->protocol = 0;  // Default is SFTP
     app_data->overwrite_all = 0;
     app_data->skip_all = 0;
     app_data->copy_aborted = 0;

@@ -21,30 +21,49 @@ void connect_ssh(AppData *data);
 void disconnect_ssh(AppData *data);
 
 void refresh_local_directory(AppData *data);
+
 void refresh_remote_directory(AppData *data);
 void refresh_remote_directory_sftp(AppData *data);
 void refresh_remote_directory_scp(AppData *data);
 
+void create_local_directory(AppData *data, const char *dirname);
+
+void create_remote_directory(AppData *data, const char *dirname);
+void create_remote_directory_sftp(AppData *data, const char *dirname);
+void create_remote_directory_scp(AppData *data, const char *dirname);
+
 void copy_file_to_remote(AppData *data, const char *local_path, const char *remote_path);
-void copy_file_from_remote(AppData *data, const char *remote_path, const char *local_path);
+void copy_file_to_remote_sftp(AppData *data, const char *local_path, const char *remote_path);
 void copy_file_to_remote_scp(AppData *data, const char *local_path, const char *remote_path);
+
+void copy_file_from_remote(AppData *data, const char *remote_path, const char *local_path);
+void copy_file_from_remote_sftp(AppData *data, const char *remote_path, const char *local_path);
 void copy_file_from_remote_scp(AppData *data, const char *remote_path, const char *local_path);
 
-void create_local_directory(AppData *data, const char *dirname);
-void create_remote_directory(AppData *data, const char *dirname);
-
 void copy_directory_to_remote(AppData *data, const char *local_path, const char *remote_path);
-void copy_directory_from_remote(AppData *data, const char *remote_path, const char *local_path);
 void copy_directory_to_remote_sftp(AppData *data, const char *local_path, const char *remote_path);
-void copy_directory_from_remote_sftp(AppData *data, const char *remote_path, const char *local_path);
 void copy_directory_to_remote_scp(AppData *data, const char *local_path, const char *remote_path);
+
+void copy_directory_from_remote(AppData *data, const char *remote_path, const char *local_path);
+void copy_directory_from_remote_sftp(AppData *data, const char *remote_path, const char *local_path);
 void copy_directory_from_remote_scp(AppData *data, const char *remote_path, const char *local_path);
 
 void delete_local_file(AppData *data, const char *path);
-void delete_remote_file(AppData *data, const char *path);
+
 void delete_local_directory_recursive(const char *path);
+
+void delete_remote_file(AppData *data, const char *path);
+void delete_remote_file_sftp(AppData *data, const char *path);
+void delete_remote_file_scp(AppData *data, const char *path);
+
 void delete_remote_directory_sftp(AppData *data, const char *path);
 void delete_remote_directory_scp(AppData *data, const char *path);
+
+void show_progress_bar(AppData *data);
+void hide_progress_bar(AppData *data);
+void update_progress_bar(AppData *data, double fraction, const char *text);
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void save_connection(AppData *data);
 void load_connection(AppData *data, const char *name);
@@ -54,8 +73,7 @@ void delete_connection(const char *name);
 GList* get_saved_connection_names(void);
 
 char* get_config_file_path(void);
-char* prompt_key_file_password(void);
-char* prompt_ssh_password(void);
+char* prompt_password(char* title_text, char* label_text, gboolean show_text);
 
 void on_browse_key_file_clicked(GtkWidget *widget, gpointer data);
 void on_support_clicked(GtkWidget *widget, gpointer data);

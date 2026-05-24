@@ -29,7 +29,7 @@ typedef struct {
     ssh_session session;
     sftp_session sftp;
     int connected;
-    int use_scp;  // 0 = SFTP, 1 = SCP
+    int protocol;  // 0 = SFTP, 1 = SCP
     
     GtkListStore *local_store;
     GtkListStore *remote_store;
